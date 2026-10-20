@@ -157,9 +157,7 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         f->cachedCount = m_objects ? m_objects->count() : 0;
         if (!m_objects) return;
 
-        CCObject* it = nullptr;
-        CCARRAY_FOREACH(m_objects, it) {
-            auto obj = static_cast<GameObject*>(it);
+        for (auto obj : CCArrayExt<GameObject*>(m_objects)) {
             if (!obj) continue;
             Kind k;
             switch (obj->m_objectType) {
@@ -200,7 +198,7 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
 
     void releaseIfPressed() {
         auto f = m_fields.self();
-        if (f->pressed) { this->releaseButton(1, true); f->pressed = false; }
+        if (f->pressed) { this->handleButton(false, 1, true); f->pressed = false; }
     }
 
     void runBot(float dt) {
@@ -265,14 +263,14 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
             if (grounded) pick = 0;
         }
         if (pick == 0) {
-            this->pushButton(1, true);
+            this->handleButton(true, 1, true);
             f->pressed = true;
         }
     }
 
-    void processCommands(float dt) {
+    void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         runBot(dt);
-        GJBaseGameLayer::processCommands(dt);
+        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
     }
 };
 
