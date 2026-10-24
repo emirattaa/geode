@@ -75,8 +75,10 @@ namespace {
     }
 
     // clickStep = -1: hiç tıklama yok. Aksi halde o adımda tıklanır.
-    bool survive(const std::vector<Obj>& L, const Params& P, float x, float y, float vy,
-                 bool grounded, int clickStep, int steps, std::vector<unsigned char>& used)
+    // Dönüş: kaç adım hayatta kaldı (steps = hiç ölmedi). pts doluysa yolu kaydeder.
+    int simulate(const std::vector<Obj>& L, const Params& P, float x, float y, float vy,
+                 bool grounded, int clickStep, int steps, std::vector<unsigned char>& used,
+                 std::vector<CCPoint>* pts)
     {
         std::fill(used.begin(), used.end(), 0);
 
@@ -106,6 +108,7 @@ namespace {
             x += P.vx * kSimDt;
 
             if (y <= P.floorY) { y = P.floorY; vy = 0.f; grounded = true; }
+            if (pts && (i & 1) == 0) pts->push_back(ccp(x, y));
 
             for (size_t j = 0; j < L.size(); ++j) {
                 const Obj& o = L[j];
@@ -118,12 +121,12 @@ namespace {
                             } else if (vy > 0.f && (prevY + P.half) <= o.y0 + kSnap) {
                                 y = o.y0 - P.half; vy = 0.f;
                             } else if (overlap(x, y, P.inner, o)) {
-                                return false; // yandan çarpma
+                                return i; // yandan çarpma
                             }
                         }
                         break;
                     case Kind::Hazard:
-                        if (overlap(x, y, P.half, o)) return false;
+                        if (overlap(x, y, P.half, o)) return i;
                         break;
                     default:
                         if (isPad(o.kind) && !used[j] && overlap(x, y, P.half, o)) {
@@ -133,7 +136,7 @@ namespace {
                 }
             }
         }
-        return true;
+        return steps;
     }
 
     float speedFallback(float s) {
@@ -171,6 +174,8 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         long tick = 0;
         long planTick = -1;
         long pressTick = -1000;
+
+        CCDrawNode* drawNode = nullptr;
     };
 
     void rebuildCache() {
@@ -219,6 +224,24 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         f->used.assign(f->local.size(), 0);
     }
 
+    void clearPaths() {
+        auto f = m_fields.self();
+        if (f->drawNode) f->drawNode->clear();
+    }
+
+    void drawPaths(const std::vector<CCPoint>& a, ccColor4F ca,
+                   const std::vector<CCPoint>& b, ccColor4F cb) {
+        auto f = m_fields.self();
+        if (!f->drawNode) {
+            if (!m_objectLayer) return;
+            f->drawNode = CCDrawNode::create();
+            m_objectLayer->addChild(f->drawNode, 10000);
+        }
+        f->drawNode->clear();
+        for (size_t i = 1; i < a.size(); ++i) f->drawNode->drawSegment(a[i - 1], a[i], 1.4f, ca);
+        for (size_t i = 1; i < b.size(); ++i) f->drawNode->drawSegment(b[i - 1], b[i], 1.4f, cb);
+    }
+
     void releaseIfPressed() {
         auto f = m_fields.self();
         if (f->pressed) { this->handleButton(false, 1, true); f->pressed = false; }
@@ -238,16 +261,16 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         auto pl = m_player1;
         if (!pl) return;
 
-        if (!Mod::get()->getSettingValue<bool>("bot-active")) {
-            releaseIfPressed();
-            f->havePrev = false;
-            return;
-        }
-        if (pl->m_isDead) { resetBotState(); return; }
+        const bool active = Mod::get()->getSettingValue<bool>("bot-active");
+        const bool showTraj = Mod::get()->getSettingValue<bool>("show-trajectory");
+        if (!active) releaseIfPressed();
+        if (!active && !showTraj) { f->havePrev = false; clearPaths(); return; }
+        if (!showTraj) clearPaths();
+        if (pl->m_isDead) { resetBotState(); clearPaths(); return; }
 
         bool cube = !(pl->m_isShip || pl->m_isBird || pl->m_isBall || pl->m_isDart ||
                       pl->m_isRobot || pl->m_isSpider || pl->m_isSwing);
-        if (!cube || pl->m_isUpsideDown) { releaseIfPressed(); f->havePrev = false; return; }
+        if (!cube || pl->m_isUpsideDown) { releaseIfPressed(); f->havePrev = false; clearPaths(); return; }
 
         if (!m_objects || m_objects->count() != f->cachedCount) rebuildCache();
 
@@ -318,27 +341,51 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         auto& L = f->local;
         auto& used = f->used;
 
-        // Tıklamasak hayatta kalır mıyız?
-        if (survive(L, P, px, py, vy, grounded, -1, steps, used)) { f->planTick = -1; return; }
+        const bool draw = showTraj && (f->tick % 4 == 0);
+        const ccColor4F cGreen  = ccc4f(0.2f, 1.0f, 0.3f, 0.95f);
+        const ccColor4F cRed    = ccc4f(1.0f, 0.2f, 0.2f, 0.95f);
+        const ccColor4F cYellow = ccc4f(1.0f, 0.9f, 0.2f, 0.7f);
+        const ccColor4F cOrange = ccc4f(1.0f, 0.55f, 0.1f, 0.95f);
+        std::vector<CCPoint> ptsA, ptsB;
 
-        // Gelecek A: zıplamazsam nereye giderim? (yukarıda baz simülasyon)
+        // Gelecek A: zıplamazsam nereye giderim?
+        const int aliveBase = simulate(L, P, px, py, vy, grounded, -1, steps, used, draw ? &ptsA : nullptr);
+        if (aliveBase >= steps) {
+            // Zıplamadan da ölmüyorum: bu versiyonu kullan (tıklama yok)
+            f->planTick = -1;
+            if (draw) {
+                // Bilgi için: "şimdi zıplasam" yolu (sarı)
+                simulate(L, P, px, py, vy, grounded, 0, steps, used, &ptsB);
+                drawPaths(ptsA, cGreen, ptsB, cYellow);
+            }
+            return;
+        }
+
         // Gelecek B(d): d tick sonra zıplarsam nereye giderim?
-        std::array<bool, kDelaySlots> ok{};
+        std::array<int, kDelaySlots> alive{};
         for (int i = 0; i < kDelaySlots; ++i) {
-            ok[i] = survive(L, P, px, py, vy, grounded, i * kDelayStride, steps, used);
+            alive[i] = simulate(L, P, px, py, vy, grounded, i * kDelayStride, steps, used, nullptr);
         }
 
         int ia = -1;
-        for (int i = 0; i < kDelaySlots; ++i) if (ok[i]) { ia = i; break; }
+        for (int i = 0; i < kDelaySlots; ++i) if (alive[i] >= steps) { ia = i; break; }
         int da, db;
-        if (ia < 0) {
-            // Kurtuluş yok; yerdeyse yine de dene
-            if (grounded) { da = 0; db = 0; } else return;
-        } else {
+        if (ia >= 0) {
             int ib = ia;
-            while (ib + 1 < kDelaySlots && ok[ib + 1]) ++ib;
+            while (ib + 1 < kDelaySlots && alive[ib + 1] >= steps) ++ib;
             da = ia * kDelayStride;
             db = ib * kDelayStride;
+        } else {
+            // İki versiyon da ölüyor: en uzun yaşayanı seç
+            int best = -1, bestAlive = aliveBase;
+            for (int i = 0; i < kDelaySlots; ++i) {
+                if (alive[i] > bestAlive) { bestAlive = alive[i]; best = i; }
+            }
+            if (best < 0) {
+                if (draw) drawPaths(ptsA, cRed, ptsB, cRed);
+                return; // zıplamak daha iyi değil
+            }
+            da = db = best * kDelayStride;
         }
 
         // Güvenli aralığın ortasında tıkla (model hatasına karşı tampon)
@@ -349,7 +396,13 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
             planDelay = f->planTick - f->tick;
         }
 
-        if (planDelay <= 0) {
+        if (draw) {
+            int drawDelay = static_cast<int>(std::max(0L, planDelay));
+            int aliveJ = simulate(L, P, px, py, vy, grounded, drawDelay, steps, used, &ptsB);
+            drawPaths(ptsA, cRed, ptsB, aliveJ >= steps ? cGreen : cOrange);
+        }
+
+        if (planDelay <= 0 && active) {
             this->handleButton(true, 1, true);
             f->pressed = true;
             f->pressTick = f->tick;
