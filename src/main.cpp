@@ -452,10 +452,15 @@ namespace {
             beam.clear();
             for (size_t i = 0; i < keys.size(); ++i)
                 if (i == 0 || keys[i].k != keys[i - 1].k) beam.push_back(keys[i].idx);
+            
+            // BEAM BUDAMA ESNASINDA STABİLİTE FİLTRESİ
             if (static_cast<int>(beam.size()) > Kbeam) {
                 std::sort(beam.begin(), beam.end(), [&](int a, int b) {
                     if (nodes[a].tog != nodes[b].tog) return nodes[a].tog < nodes[b].tog;
-                    return a < b;
+                    // Tehdit yoksa gereksiz zıplamaları önle, yerde kalmayı tercih et
+                    if (nodes[a].s.grounded != nodes[b].s.grounded) return nodes[a].s.grounded;
+                    // Uçan modlarda yalpalamamak için düşük dikey hızı (vy) tercih et
+                    return std::fabs(nodes[a].s.vy) < std::fabs(nodes[b].s.vy);
                 });
                 beam.resize(Kbeam);
             }
@@ -466,10 +471,14 @@ namespace {
         if (lastStage == stages && !beam.empty()) {
             out.survived = true;
             std::vector<int> order = beam;
+            
+            // FİNAL KARAR ESNASINDA STABİLİTE FİLTRESİ
             std::sort(order.begin(), order.end(), [&](int a, int b) {
                 if (nodes[a].tog != nodes[b].tog) return nodes[a].tog < nodes[b].tog;
-                return a < b;
+                if (nodes[a].s.grounded != nodes[b].s.grounded) return nodes[a].s.grounded;
+                return std::fabs(nodes[a].s.vy) < std::fabs(nodes[b].s.vy);
             });
+            
             // En güvenli planı seç: tehlike hitbox'ını şişirerek test et (model hatası tamponu)
             const float margins[3] = {5.f, 3.f, 1.f};
             bool found = false;
@@ -771,8 +780,9 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         f->prevMode = mode; f->prevGrounded = grounded;
         if (f->vx <= 0.f) f->vx = 311.58f;
 
-        // ---------- durum + yerel dünya ----------
-        const int horizonSteps = std::max(60, static_cast<int>(
+        // TRAJECTORY VE BEAM GÜNCELLEMELERİ
+        // Look-ahead minimum 240 adım (1 saniye) olacak şekilde yükseltildi
+        const int horizonSteps = std::max(240, static_cast<int>(
             Mod::get()->getSettingValue<double>("look-ahead") * 240.0));
         gather(px, f->vx * (horizonSteps / 240.f) + 60.f);
         const int n = static_cast<int>(f->local.size());
@@ -783,7 +793,7 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         root.mode = static_cast<int8_t>(mode); root.mini = mini; root.grounded = grounded;
         root.held = f->held; root.prevHeld = f->held2;
         root.gb = C.groundB;
-        {   // mod alanı: son geçilen mod portalından
+        {   
             float pc = py;
             for (auto& p : f->modePortals) { if (p.x1 <= px + 1.f) pc = (p.y0 + p.y1) * 0.5f; else break; }
             areaFromCenter(root, mode, pc);
@@ -801,7 +811,6 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
             (void)tmp;
         }
 
-        // ---------- plan: doğrula, gerekirse yeniden ara ----------
         if (!f->plan.empty()) f->planPos += steps;
         const bool draw = showTraj;
         bool need = f->plan.empty() || f->planPos + 24 > f->plan.size();
@@ -809,7 +818,8 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         if (!need && f->tick - f->lastSearch >= 4) need = true;
 
         if (need) {
-            int Kb = std::clamp(static_cast<int>(Mod::get()->getSettingValue<int64_t>("trajectory-count")), 4, 60);
+            // Trajectory (beam) sayısı minimum 120 olacak şekilde güncellendi, hesaplama derinliği arttırıldı
+            int Kb = std::max(120, static_cast<int>(Mod::get()->getSettingValue<int64_t>("trajectory-count")));
             const int D = 3;
             int stagesN = std::max(12, horizonSteps / D);
             auto res = runSearch(root, L, n, C, Kb, D, stagesN, draw);
@@ -819,7 +829,6 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
             if (draw) drawLines(res.lines);
         }
 
-        // ---------- eylem ----------
         bool want = false;
         if (!f->plan.empty()) want = f->plan[std::min(f->planPos, f->plan.size() - 1)] != 0;
         if (!active) want = false;
@@ -865,7 +874,7 @@ class $modify(CubeBotPause, PauseLayer) {
 
     void onToggleBot(CCObject* sender) {
         auto t = static_cast<CCMenuItemToggler*>(sender);
-        bool newValue = !t->isToggled();   // callback anında eski durum
+        bool newValue = !t->isToggled();   
         Mod::get()->setSettingValue<bool>("bot-active", newValue);
     }
 };
