@@ -327,7 +327,7 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         CCRect pr = pl->getObjectRect();
         float half = (pr.size.width > 4.f && pr.size.width < 40.f) ? pr.size.width * 0.5f : 15.f * scale;
 
-        float look = static_cast<float>(Mod::get()->getSettingValue<double>("look-ahead"));
+        float look = static_cast<float>(Mod::get()->getSettingValue<double>("look-ahead")) * 10.0f;
         int steps = std::max(60, static_cast<int>(look / kSimDt));
 
         gather(px, py, f->vx * look + 60.f);
