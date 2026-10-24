@@ -6,7 +6,7 @@
     "mac": "2.2081",
     "ios": "2.2081"
   },
-  "version": "v0.3.0",
+  "version": "v0.4.0",
   "id": "yourname.cube-autoplay",
   "name": "Cube Autoplay",
   "developer": "YourName",
@@ -38,6 +38,12 @@
       "name": "Debug log",
       "description": "Her zıplamada konum ve ölçülen fizik değerlerini log'a yazar.",
       "default": false
+    },
+    "show-trajectory": {
+      "type": "bool",
+      "name": "Yörünge çizgileri",
+      "description": "Karakterin zıplarsa / zıplamazsa gideceği yolu çizer. Kırmızı: ölüyor, yeşil: hayatta kalıyor, sarı: şimdi zıplasa. Bot kapalıyken de çalışır.",
+      "default": true
     }
   }
 }
