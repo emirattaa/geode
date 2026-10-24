@@ -6,11 +6,11 @@
     "mac": "2.2081",
     "ios": "2.2081"
   },
-  "version": "v0.4.0",
+  "version": "v0.5.0",
   "id": "yourname.cube-autoplay",
-  "name": "Cube Autoplay",
+  "name": "Geode Autoplay",
   "developer": "YourName",
-  "description": "Cube modunda leveli otomatik oynar. Pause menüsünden açılıp kapanır.",
+  "description": "Tüm modlarda (cube, ship, ball, UFO, wave, robot, spider, swing) otomatik oynar. Orb, pad, portal ve slope destekli. Pause menüsünden açılıp kapanır.",
   "tags": [
     "gameplay",
     "utility"
@@ -26,9 +26,9 @@
       "type": "float",
       "name": "İleri bakış (saniye)",
       "description": "Bot engelleri kaç saniye önceden simüle etsin. Yüksek değer daha güvenli ama daha yavaş.",
-      "default": 0.6,
-      "min": 0.4,
-      "max": 1.5,
+      "default": 0.5,
+      "min": 0.25,
+      "max": 0.8,
       "control": {
         "slider": true
       }
@@ -42,8 +42,19 @@
     "show-trajectory": {
       "type": "bool",
       "name": "Yörünge çizgileri",
-      "description": "Karakterin zıplarsa / zıplamazsa gideceği yolu çizer. Kırmızı: ölüyor, yeşil: hayatta kalıyor, sarı: şimdi zıplasa. Bot kapalıyken de çalışır.",
+      "description": "Simüle edilen yörüngeleri çizer. Yeşil: hayatta kalan denemeler, kırmızı: ölen denemeler, mavi: seçilen yol. Bot kapalıyken de çalışır.",
       "default": true
+    },
+    "trajectory-count": {
+      "type": "int",
+      "name": "Yörünge sayısı",
+      "description": "Aynı anda kaç farklı giriş planı denensin (varsayılan 30). Yavaşlarsa düşür.",
+      "default": 30,
+      "min": 4,
+      "max": 60,
+      "control": {
+        "slider": true
+      }
     }
   }
 }
