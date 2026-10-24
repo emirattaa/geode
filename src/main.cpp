@@ -36,10 +36,11 @@ namespace {
         float jumpVy;  // zıplama başlangıç hızı (vy birimi)
     };
 
-    constexpr float kSimDt        = 1.f / 120.f;
+    constexpr float kSimDt        = 1.f / 240.f; // GD fizik tick'i
     constexpr float kMaxFallV     = -15.f;
-    constexpr float kSnap         = 10.f;   // bloğa "yapışma" eşiği
-    constexpr int   kMaxDelay     = 40;     // 40 * 1/120 sn
+    constexpr float kSnap         = 10.f;   // küp için bloğa "yapışma" eşiği
+    constexpr int   kDelayStride  = 2;      // gecikme taraması adımı (tick)
+    constexpr int   kDelaySlots   = 41;     // 0..80 tick (0.33 sn)
     constexpr float kDefaultFloor = 105.f;
 
     float padVy(Kind k) {
@@ -162,13 +163,14 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         bool prevGrounded = true;
         float vx = 0.f;
         float k = 60.f;
-        float g = 0.958199f * 60.f;
-        float jumpVy = 11.180032f;
+        float g = 46.3f;      // başlangıç tahmini; oyundan ölçülünce güncellenir
+        float jumpVy = 9.94f; // başlangıç tahmini; ilk zıplamada ölçülür
         bool awaitJump = false;
         float sincePress = 0.f;
 
         long tick = 0;
         long planTick = -1;
+        long pressTick = -1000;
     };
 
     void rebuildCache() {
@@ -251,7 +253,7 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
 
         f->acc += dt;
         f->sincePress += dt;
-        if (f->acc < kSimDt) return;
+        if (f->acc < kSimDt * 0.99f) return;
         const float dtp = f->acc;
         f->acc = 0.f;
         f->tick++;
@@ -291,8 +293,11 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         f->prevX = px; f->prevY = py; f->prevVy = vy; f->prevGrounded = grounded;
         if (f->vx <= 0.f) f->vx = speedFallback(pl->m_playerSpeed);
 
-        // Önceki tıklamayı bırak (orb'lar için taze tıklama gerekir)
-        if (f->pressed) { releaseIfPressed(); return; }
+        // Tıklamayı 2 tick basılı tut, sonra bırak (orb'lar için taze tıklama gerekir)
+        if (f->pressed) {
+            if (f->tick - f->pressTick >= 2) releaseIfPressed();
+            return;
+        }
 
         // --- Planlama ---
         float scale = pl->m_vehicleSize > 0.f ? pl->m_vehicleSize : 1.f;
@@ -300,7 +305,7 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         float half = (pr.size.width > 4.f && pr.size.width < 40.f) ? pr.size.width * 0.5f : 15.f * scale;
 
         float look = static_cast<float>(Mod::get()->getSettingValue<double>("look-ahead"));
-        int steps = std::max(30, static_cast<int>(look / kSimDt));
+        int steps = std::max(60, static_cast<int>(look / kSimDt));
 
         gather(px, py, f->vx * look + 60.f);
 
@@ -316,19 +321,25 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         // Tıklamasak hayatta kalır mıyız?
         if (survive(L, P, px, py, vy, grounded, -1, steps, used)) { f->planTick = -1; return; }
 
-        std::array<bool, kMaxDelay + 1> ok{};
-        for (int d = 0; d <= kMaxDelay; ++d) {
-            ok[d] = survive(L, P, px, py, vy, grounded, d, steps, used);
+        // Gelecek A: zıplamazsam nereye giderim? (yukarıda baz simülasyon)
+        // Gelecek B(d): d tick sonra zıplarsam nereye giderim?
+        std::array<bool, kDelaySlots> ok{};
+        for (int i = 0; i < kDelaySlots; ++i) {
+            ok[i] = survive(L, P, px, py, vy, grounded, i * kDelayStride, steps, used);
         }
 
-        int da = -1;
-        for (int d = 0; d <= kMaxDelay; ++d) if (ok[d]) { da = d; break; }
-        if (da < 0) {
+        int ia = -1;
+        for (int i = 0; i < kDelaySlots; ++i) if (ok[i]) { ia = i; break; }
+        int da, db;
+        if (ia < 0) {
             // Kurtuluş yok; yerdeyse yine de dene
-            if (grounded) da = 0; else return;
+            if (grounded) { da = 0; db = 0; } else return;
+        } else {
+            int ib = ia;
+            while (ib + 1 < kDelaySlots && ok[ib + 1]) ++ib;
+            da = ia * kDelayStride;
+            db = ib * kDelayStride;
         }
-        int db = da;
-        while (db + 1 <= kMaxDelay && ok[db + 1]) ++db;
 
         // Güvenli aralığın ortasında tıkla (model hatasına karşı tampon)
         long planDelay = f->planTick - f->tick;
@@ -341,6 +352,7 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         if (planDelay <= 0) {
             this->handleButton(true, 1, true);
             f->pressed = true;
+            f->pressTick = f->tick;
             f->planTick = -1;
             if (grounded) { f->awaitJump = true; f->sincePress = 0.f; }
             if (Mod::get()->getSettingValue<bool>("debug-log")) {
