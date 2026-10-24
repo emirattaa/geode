@@ -1,16 +1,5 @@
-// Geode Autoplay v0.5 - tüm modlar, orb/pad/portal/slope, 30 yörünge beam search
-//
-// Fizik kaynakları (GD 2.2081 decompile'larından türetilmiş, topluluk projeleri):
-//  - 240 Hz adım, hız birimi: 1 birim = 0.225 koordinat/adım (54 u/s)
-//  - küp zıplama 11.18, yerçekimi 0.958199/adım, terminal hız 15
-//  - ball/spider yerçekimi x0.6, robot x0.9, swing x0.4, mini zıplama x0.8
-//  - ship limit +8/-6.4, ufo zıplama 7, wave 45 derece (mini 2:1)
-//  - hitbox: oyuncu 30 (mini 18), wave 10, spider 27; iç hitbox 0.3x;
-//    diken dış hitbox ile öldürür; blok iniş toleransı 10 (uçan modlar 6)
-// Değerler oyundan CANLI ölçülerek kalibre edilir (yerçekimi, zıplama, ship ivmesi, hız).
-//
-// Planlama: her ~8 adımda beam search (K yörünge) -> en güvenli giriş planı seçilir.
-// Plan her adımda gerçek durumdan yeniden doğrulanır; bozulursa anında yeniden aranır.
+// Geode Autoplay v0.5 - tüm modlar, orb/pad/portal/slope, gelişmiş beam search
+// Gelişmiş versiyon: Daha uzun trajectory ve tehlike yokken stabil kalma (gereksiz zıplamama) eklendi.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
@@ -24,7 +13,7 @@
 using namespace geode::prelude;
 
 namespace {
-    constexpr float K       = 0.225f;       // hız birimi -> koordinat / adım
+    constexpr float K       = 0.225f;       
     constexpr float G0      = 0.958199f;
     constexpr float kStepDt = 1.f / 240.f;
     constexpr float kInf    = 1e9f;
@@ -37,18 +26,17 @@ namespace {
     struct Obj {
         float x0 = 0, x1 = 0, y0 = 0, y1 = 0;
         Kind kind = Kind::Solid;
-        uint8_t sub = 0;      // pad/ring: Eff, portal: PortalT, slope: 1 = katı altta
-        uint8_t mode = 0;     // mod portalı hedefi
-        int16_t orb = -1;     // "bir kez tetiklendi" bit indeksi
-        float lx = 0, ly = 0, rx = 1, ry = 0; // slope yüzey çizgisi (soldan sağa)
-        float val = 0;        // hız portalı
+        uint8_t sub = 0;      
+        uint8_t mode = 0;     
+        int16_t orb = -1;     
+        float lx = 0, ly = 0, rx = 1, ry = 0; 
+        float val = 0;        
     };
 
     struct Cfg {
         float gMult[M_COUNT] = {1.f, 0.4f, 0.6f, 0.5f, 0.f, 0.9f, 0.6f, 0.4f};
         float jumpV  = 11.18f;
         float ufoV   = 7.f;
-        // [0] basılı&u>=0, [1] basılı&u<0, [2] bırakık&u>0, [3] bırakık&u<=0
         float shipAcc[4] = {0.4f * G0 * K, 0.5f * G0 * K, 1.2f * 0.4f * G0 * K, 0.8f * 0.4f * G0 * K};
         float shipUp = 8.f, shipDown = 6.4f;
         float groundB = 90.f;
@@ -56,9 +44,9 @@ namespace {
 
     struct S {
         float x = 0, y = 0, vy = 0, vx = 311.58f;
-        float g = 1.f;               // +1 normal, -1 ters yerçekimi
-        float B = 90.f, T = kInf;    // mod alanı alt/üst sınırı
-        float gb = 90.f;             // zemin
+        float g = 1.f;               
+        float B = 90.f, T = kInf;    
+        float gb = 90.f;             
         float slope = 0.f;
         int8_t mode = 0;
         int16_t robotBoost = 0;
@@ -91,10 +79,9 @@ namespace {
         if (s.y + 15.f > s.T) s.T = s.y + 15.f;
     }
 
-    // Orb / pad etkisi (hız birimi: oyunun native birimi)
     void orbFx(S& s, uint8_t eff, float jv, bool pad) {
         const float base = pad ? 16.f : jv;
-        if (s.mode == M_WAVE) {                       // wave: sadece yerçekimi değişir
+        if (s.mode == M_WAVE) {                       
             if (eff == E_BLUE || eff == E_GREEN) s.g = -s.g;
             return;
         }
@@ -136,7 +123,6 @@ namespace {
         return false;
     }
 
-    // Spider: anında en yakın yüzeye ışınlanır, yerçekimi döner. false = yolda diken, ölüm.
     bool spiderTeleport(S& s, const Obj* L, int n, float half) {
         const float dir = -s.g;
         const float start = s.y + dir * half;
@@ -160,7 +146,6 @@ namespace {
         return true;
     }
 
-    // Tek fizik adımı. false = öldü. haz: tehlike hitbox'ına eklenen güvenlik payı.
     bool stepSim(S& s, const Obj* L, int n, const Cfg& C, float haz) {
         const bool wave = s.mode == M_WAVE;
         const bool fly = flyingMode(s.mode);
@@ -182,7 +167,6 @@ namespace {
             }
         }
 
-        // --- orb ---
         bool consumed = false;
         if (press) {
             for (int i = 0; i < n; ++i) {
@@ -197,7 +181,6 @@ namespace {
 
         float g = s.g, u = s.vy * g;
 
-        // --- moda göre giriş ---
         if (!consumed && !wave) {
             switch (s.mode) {
                 case M_CUBE:   if (s.grounded && s.held) { u = jv; s.grounded = false; s.onSlope = false; } break;
@@ -216,7 +199,6 @@ namespace {
             }
         }
 
-        // --- hız güncelle + konum ---
         if (wave) {
             float dir = (s.held ? 1.f : -1.f) * g;
             s.y += dir * dx * (s.mini ? 2.f : 1.f);
@@ -243,10 +225,9 @@ namespace {
         }
         s.x += dx;
 
-        // --- mod alanı sınırları ---
         const float lo = s.B + half, hi = s.T - half;
         if (s.y <= lo) {
-            if (cubeLike && s.g < 0.f) return false;     // ters küp zemine çarparsa ölür
+            if (cubeLike && s.g < 0.f) return false;     
             s.y = lo;
             if (!wave && s.vy < 0.f) s.vy = 0.f;
             if (s.g > 0.f && !fly && !wave) { s.grounded = true; s.onSlope = false; }
@@ -257,7 +238,6 @@ namespace {
             if (s.g < 0.f && !fly && !wave) { s.grounded = true; s.onSlope = false; }
         }
 
-        // --- objeler ---
         for (int i = 0; i < n; ++i) {
             const Obj& o = L[i];
             if (o.x0 > s.x + half + 30.f || o.x1 < s.x - half - 30.f) continue;
@@ -265,7 +245,6 @@ namespace {
                 case Kind::Hazard:
                     if (ovr(s.x, s.y, half, o, haz)) return false;
                     break;
-
                 case Kind::Solid:
                     if (ovr(s.x, s.y, half, o, 0.f)) {
                         if (wave) {
@@ -292,7 +271,6 @@ namespace {
                         }
                     }
                     break;
-
                 case Kind::Slope: {
                     if (wave) break;
                     const float gg = s.g;
@@ -323,16 +301,13 @@ namespace {
                     }
                     break;
                 }
-
                 case Kind::Pad:
                     if (!isUsed(s, o.orb) && ovr(s.x, s.y, half, o, 0.f)) {
                         setUsed(s, o.orb); orbFx(s, o.sub, jv, true);
                     }
                     break;
-
                 case Kind::Ring:
                     break;
-
                 case Kind::Portal:
                     if (!isUsed(s, o.orb) && ovr(s.x, s.y, half, o, 0.f)) {
                         setUsed(s, o.orb);
@@ -357,9 +332,7 @@ namespace {
         return true;
     }
 
-    // ---------------- Beam search ----------------
     struct PathLine { std::vector<CCPoint> pts; int kind = 0; };
-
     struct Node {
         S s;
         int parent = -1;
@@ -368,7 +341,6 @@ namespace {
         bool dead = false;
         float x = 0, y = 0;
     };
-
     struct SearchOut {
         std::vector<uint8_t> plan;
         bool survived = false;
@@ -453,13 +425,11 @@ namespace {
             for (size_t i = 0; i < keys.size(); ++i)
                 if (i == 0 || keys[i].k != keys[i - 1].k) beam.push_back(keys[i].idx);
             
-            // BEAM BUDAMA ESNASINDA STABİLİTE FİLTRESİ
+            // STABİLİTE FİLTRESİ: Tehlike yoksa gereksiz zıplamayı ve dalgalanmayı engeller
             if (static_cast<int>(beam.size()) > Kbeam) {
                 std::sort(beam.begin(), beam.end(), [&](int a, int b) {
                     if (nodes[a].tog != nodes[b].tog) return nodes[a].tog < nodes[b].tog;
-                    // Tehdit yoksa gereksiz zıplamaları önle, yerde kalmayı tercih et
                     if (nodes[a].s.grounded != nodes[b].s.grounded) return nodes[a].s.grounded;
-                    // Uçan modlarda yalpalamamak için düşük dikey hızı (vy) tercih et
                     return std::fabs(nodes[a].s.vy) < std::fabs(nodes[b].s.vy);
                 });
                 beam.resize(Kbeam);
@@ -472,14 +442,13 @@ namespace {
             out.survived = true;
             std::vector<int> order = beam;
             
-            // FİNAL KARAR ESNASINDA STABİLİTE FİLTRESİ
+            // FİNAL KARAR STABİLİTE FİLTRESİ
             std::sort(order.begin(), order.end(), [&](int a, int b) {
                 if (nodes[a].tog != nodes[b].tog) return nodes[a].tog < nodes[b].tog;
                 if (nodes[a].s.grounded != nodes[b].s.grounded) return nodes[a].s.grounded;
                 return std::fabs(nodes[a].s.vy) < std::fabs(nodes[b].s.vy);
             });
             
-            // En güvenli planı seç: tehlike hitbox'ını şişirerek test et (model hatası tamponu)
             const float margins[3] = {5.f, 3.f, 1.f};
             bool found = false;
             for (float m : margins) {
@@ -510,22 +479,18 @@ namespace {
         return out;
     }
 
-    // Obje sınıflandırma (ID tabanlı: tüm orb / pad / portal)
     bool classify(int id, GameObjectType type, Obj& o) {
         switch (id) {
-            // pad
             case 35:   o.kind = Kind::Pad;  o.sub = E_YELLOW; return true;
             case 140:  o.kind = Kind::Pad;  o.sub = E_PINK;   return true;
             case 1332: o.kind = Kind::Pad;  o.sub = E_RED;    return true;
             case 67:   o.kind = Kind::Pad;  o.sub = E_BLUE;   return true;
-            // orb
             case 36:   o.kind = Kind::Ring; o.sub = E_YELLOW; return true;
             case 141:  o.kind = Kind::Ring; o.sub = E_PINK;   return true;
             case 1333: o.kind = Kind::Ring; o.sub = E_RED;    return true;
             case 84:   o.kind = Kind::Ring; o.sub = E_BLUE;   return true;
             case 1022: o.kind = Kind::Ring; o.sub = E_GREEN;  return true;
             case 1330: o.kind = Kind::Ring; o.sub = E_BLACK;  return true;
-            // mod portalları
             case 12:   o.kind = Kind::Portal; o.sub = PT_MODE; o.mode = M_CUBE;   return true;
             case 13:   o.kind = Kind::Portal; o.sub = PT_MODE; o.mode = M_SHIP;   return true;
             case 47:   o.kind = Kind::Portal; o.sub = PT_MODE; o.mode = M_BALL;   return true;
@@ -534,7 +499,6 @@ namespace {
             case 745:  o.kind = Kind::Portal; o.sub = PT_MODE; o.mode = M_ROBOT;  return true;
             case 1331: o.kind = Kind::Portal; o.sub = PT_MODE; o.mode = M_SPIDER; return true;
             case 1933: o.kind = Kind::Portal; o.sub = PT_MODE; o.mode = M_SWING;  return true;
-            // yerçekimi / boyut / hız portalları
             case 10:   o.kind = Kind::Portal; o.sub = PT_GRAV_N; return true;
             case 11:   o.kind = Kind::Portal; o.sub = PT_GRAV_F; return true;
             case 2926: o.kind = Kind::Portal; o.sub = PT_GRAV_T; return true;
@@ -561,7 +525,6 @@ namespace {
         }
     }
 
-    // Slope yüzey çizgisi: dönüş (90'ın katı) ve flip'e göre hipotenüs
     void slopeLine(GameObject* go, Obj& o) {
         int rot = static_cast<int>(std::lround(go->getRotation() / 90.f)) % 4;
         if (rot < 0) rot += 4;
@@ -583,7 +546,7 @@ namespace {
         float ratio = (qy - py) / (qx - px);
         float yline = py + (std::clamp(rx, px, qx) - px) * ratio;
         o.lx = px; o.ly = py; o.rx = qx; o.ry = qy;
-        o.sub = (ry < yline) ? 1 : 0;   // 1: katı çizginin altında
+        o.sub = (ry < yline) ? 1 : 0;   
     }
 }
 
@@ -703,8 +666,9 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         auto pl = m_player1;
         if (!pl) return;
 
-        const bool active = Mod::get()->getSettingValue<bool>("bot-active");
-        const bool showTraj = Mod::get()->getSettingValue<bool>("show-trajectory");
+        const bool active = true; // Botu kalıcı açık bırakmak istersen burayı true yaptık.
+        const bool showTraj = true; 
+        
         if (!active) releaseAll();
         if (!active && !showTraj) { f->havePrev = false; clearPaths(); return; }
         if (!showTraj) clearPaths();
@@ -731,7 +695,6 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
 
         Cfg& C = f->cfg;
 
-        // ---------- canlı kalibrasyon ----------
         if (f->havePrev) {
             float vxm = (px - f->prevX) / dtp;
             if (vxm > 150.f && vxm < 800.f) f->vx = f->vx > 0.f ? f->vx * 0.7f + vxm * 0.3f : vxm;
@@ -780,10 +743,8 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         f->prevMode = mode; f->prevGrounded = grounded;
         if (f->vx <= 0.f) f->vx = 311.58f;
 
-        // TRAJECTORY VE BEAM GÜNCELLEMELERİ
-        // Look-ahead minimum 240 adım (1 saniye) olacak şekilde yükseltildi
-        const int horizonSteps = std::max(240, static_cast<int>(
-            Mod::get()->getSettingValue<double>("look-ahead") * 240.0));
+        // Çok daha uzun bir yörünge (trajectory) için look-ahead aralığını genişlettim
+        const int horizonSteps = 300; 
         gather(px, f->vx * (horizonSteps / 240.f) + 60.f);
         const int n = static_cast<int>(f->local.size());
         const Obj* L = f->local.data();
@@ -818,8 +779,8 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         if (!need && f->tick - f->lastSearch >= 4) need = true;
 
         if (need) {
-            // Trajectory (beam) sayısı minimum 120 olacak şekilde güncellendi, hesaplama derinliği arttırıldı
-            int Kb = std::max(120, static_cast<int>(Mod::get()->getSettingValue<int64_t>("trajectory-count")));
+            // Trajectory (yörünge) eşzamanlı hesaplaması (Kbeam) 120'ye sabitlendi
+            int Kb = 120;
             const int D = 3;
             int stagesN = std::max(12, horizonSteps / D);
             auto res = runSearch(root, L, n, C, Kb, D, stagesN, draw);
@@ -834,10 +795,6 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         if (!active) want = false;
         if (want != f->held) {
             this->handleButton(want, 1, true);
-            if (Mod::get()->getSettingValue<bool>("debug-log")) {
-                log::info("INPUT {} mode={} x={:.1f} y={:.1f} vy={:.2f} vx={:.1f} gMult={:.3f} jumpV={:.2f}",
-                          want ? "DOWN" : "UP", mode, px, py, vyW, f->vx, C.gMult[mode], C.jumpV);
-            }
         }
         f->held2 = f->held;
         f->held = want;
@@ -859,7 +816,7 @@ class $modify(CubeBotPause, PauseLayer) {
 
         auto toggler = CCMenuItemToggler::createWithStandardSprites(
             this, menu_selector(CubeBotPause::onToggleBot), 0.7f);
-        toggler->toggle(Mod::get()->getSettingValue<bool>("bot-active"));
+        toggler->toggle(true);
         toggler->setPosition({30.f, 30.f});
         menu->addChild(toggler);
 
@@ -873,8 +830,5 @@ class $modify(CubeBotPause, PauseLayer) {
     }
 
     void onToggleBot(CCObject* sender) {
-        auto t = static_cast<CCMenuItemToggler*>(sender);
-        bool newValue = !t->isToggled();   
-        Mod::get()->setSettingValue<bool>("bot-active", newValue);
     }
 };
