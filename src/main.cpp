@@ -1,5 +1,16 @@
-// Geode Autoplay v0.5 - tüm modlar, orb/pad/portal/slope, gelişmiş beam search
-// Gelişmiş versiyon: Daha uzun trajectory ve tehlike yokken stabil kalma (gereksiz zıplamama) eklendi.
+// Geode Autoplay v0.5 - tüm modlar, orb/pad/portal/slope, 30 yörünge beam search
+//
+// Fizik kaynakları (GD 2.2081 decompile'larından türetilmiş, topluluk projeleri):
+//  - 240 Hz adım, hız birimi: 1 birim = 0.225 koordinat/adım (54 u/s)
+//  - küp zıplama 11.18, yerçekimi 0.958199/adım, terminal hız 15
+//  - ball/spider yerçekimi x0.6, robot x0.9, swing x0.4, mini zıplama x0.8
+//  - ship limit +8/-6.4, ufo zıplama 7, wave 45 derece (mini 2:1)
+//  - hitbox: oyuncu 30 (mini 18), wave 10, spider 27; iç hitbox 0.3x;
+//    diken dış hitbox ile öldürür; blok iniş toleransı 10 (uçan modlar 6)
+// Değerler oyundan CANLI ölçülerek kalibre edilir (yerçekimi, zıplama, ship ivmesi, hız).
+//
+// Planlama: her ~8 adımda beam search (K yörünge) -> en güvenli giriş planı seçilir.
+// Plan her adımda gerçek durumdan yeniden doğrulanır; bozulursa anında yeniden aranır.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
@@ -7,13 +18,14 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <chrono>
 #include <cstdint>
 #include <vector>
 
 using namespace geode::prelude;
 
 namespace {
-    constexpr float K       = 0.225f;       
+    constexpr float K       = 0.225f;       // hız birimi -> koordinat / adım
     constexpr float G0      = 0.958199f;
     constexpr float kStepDt = 1.f / 240.f;
     constexpr float kInf    = 1e9f;
@@ -26,17 +38,18 @@ namespace {
     struct Obj {
         float x0 = 0, x1 = 0, y0 = 0, y1 = 0;
         Kind kind = Kind::Solid;
-        uint8_t sub = 0;      
-        uint8_t mode = 0;     
-        int16_t orb = -1;     
-        float lx = 0, ly = 0, rx = 1, ry = 0; 
-        float val = 0;        
+        uint8_t sub = 0;      // pad/ring: Eff, portal: PortalT, slope: 1 = katı altta
+        uint8_t mode = 0;     // mod portalı hedefi
+        int16_t orb = -1;     // "bir kez tetiklendi" bit indeksi
+        float lx = 0, ly = 0, rx = 1, ry = 0; // slope yüzey çizgisi (soldan sağa)
+        float val = 0;        // hız portalı
     };
 
     struct Cfg {
         float gMult[M_COUNT] = {1.f, 0.4f, 0.6f, 0.5f, 0.f, 0.9f, 0.6f, 0.4f};
         float jumpV  = 11.18f;
         float ufoV   = 7.f;
+        // [0] basılı&u>=0, [1] basılı&u<0, [2] bırakık&u>0, [3] bırakık&u<=0
         float shipAcc[4] = {0.4f * G0 * K, 0.5f * G0 * K, 1.2f * 0.4f * G0 * K, 0.8f * 0.4f * G0 * K};
         float shipUp = 8.f, shipDown = 6.4f;
         float groundB = 90.f;
@@ -44,9 +57,9 @@ namespace {
 
     struct S {
         float x = 0, y = 0, vy = 0, vx = 311.58f;
-        float g = 1.f;               
-        float B = 90.f, T = kInf;    
-        float gb = 90.f;             
+        float g = 1.f;               // +1 normal, -1 ters yerçekimi
+        float B = 90.f, T = kInf;    // mod alanı alt/üst sınırı
+        float gb = 90.f;             // zemin
         float slope = 0.f;
         int8_t mode = 0;
         int16_t robotBoost = 0;
@@ -70,6 +83,12 @@ namespace {
     inline bool isUsed(const S& s, int i) { return i >= 0 && ((s.used[i >> 6] >> (i & 63)) & 1ull); }
     inline void setUsed(S& s, int i) { if (i >= 0) s.used[i >> 6] |= (1ull << (i & 63)); }
 
+    // x'e göre sıralı obje listesi + x1 için kümülatif maksimum (ikili arama ile hızlı aralık)
+    struct World { const Obj* L; const float* pm; int n; };
+    inline int firstIdx(const World& W, float minX) {
+        return static_cast<int>(std::lower_bound(W.pm, W.pm + W.n, minX) - W.pm);
+    }
+
     void areaFromCenter(S& s, int mode, float pc) {
         float H = modeHeight(mode);
         if (H >= kInf) { s.B = s.gb; s.T = kInf; return; }
@@ -79,9 +98,10 @@ namespace {
         if (s.y + 15.f > s.T) s.T = s.y + 15.f;
     }
 
+    // Orb / pad etkisi (hız birimi: oyunun native birimi)
     void orbFx(S& s, uint8_t eff, float jv, bool pad) {
         const float base = pad ? 16.f : jv;
-        if (s.mode == M_WAVE) {                       
+        if (s.mode == M_WAVE) {                       // wave: sadece yerçekimi değişir
             if (eff == E_BLUE || eff == E_GREEN) s.g = -s.g;
             return;
         }
@@ -97,13 +117,13 @@ namespace {
         s.grounded = false; s.onSlope = false;
     }
 
-    bool supportedNow(S& s, const Obj* L, int n, float half) {
+    bool supportedNow(S& s, const World& W, float half) {
         const float g = s.g;
         if (g > 0.f) { if (s.y - half <= s.B + 0.6f) { s.onSlope = false; return true; } }
         else if (s.T < kInf * 0.5f) { if (s.y + half >= s.T - 0.6f) { s.onSlope = false; return true; } }
-        for (int i = 0; i < n; ++i) {
-            const Obj& o = L[i];
-            if (o.x0 > s.x + half + 4.f || o.x1 < s.x - half - 4.f) continue;
+        for (int i = firstIdx(W, s.x - half - 4.f); i < W.n && W.L[i].x0 <= s.x + half + 4.f; ++i) {
+            const Obj& o = W.L[i];
+            if (o.x1 < s.x - half - 4.f) continue;
             if (o.kind == Kind::Solid) {
                 if (s.x + half > o.x0 && s.x - half < o.x1) {
                     float feet = s.y - g * half, face = g > 0.f ? o.y1 : o.y0;
@@ -123,20 +143,21 @@ namespace {
         return false;
     }
 
-    bool spiderTeleport(S& s, const Obj* L, int n, float half) {
+    // Spider: anında en yakın yüzeye ışınlanır, yerçekimi döner. false = yolda diken, ölüm.
+    bool spiderTeleport(S& s, const World& W, float half) {
         const float dir = -s.g;
         const float start = s.y + dir * half;
         float best = dir > 0.f ? s.T : s.B;
-        for (int i = 0; i < n; ++i) {
-            const Obj& o = L[i];
+        for (int i = firstIdx(W, s.x - half); i < W.n && W.L[i].x0 <= s.x + half; ++i) {
+            const Obj& o = W.L[i];
             if (o.kind != Kind::Solid) continue;
             if (!(s.x + half - 1.f > o.x0 && s.x - half + 1.f < o.x1)) continue;
             if (dir > 0.f) { if (o.y0 >= start - 1.f && o.y0 < best) best = o.y0; }
             else           { if (o.y1 <= start + 1.f && o.y1 > best) best = o.y1; }
         }
         if (std::fabs(best) > kInf * 0.5f) return true;
-        for (int i = 0; i < n; ++i) {
-            const Obj& o = L[i];
+        for (int i = firstIdx(W, s.x - half); i < W.n && W.L[i].x0 <= s.x + half; ++i) {
+            const Obj& o = W.L[i];
             if (o.kind != Kind::Hazard) continue;
             if (!(s.x + half > o.x0 && s.x - half < o.x1)) continue;
             if (dir > 0.f) { if (o.y1 > start && o.y0 < best) return false; }
@@ -146,7 +167,8 @@ namespace {
         return true;
     }
 
-    bool stepSim(S& s, const Obj* L, int n, const Cfg& C, float haz) {
+    // Tek fizik adımı. false = öldü. haz: tehlike hitbox'ına eklenen güvenlik payı.
+    bool stepSim(S& s, const World& W, const Cfg& C, float haz) {
         const bool wave = s.mode == M_WAVE;
         const bool fly = flyingMode(s.mode);
         const bool cubeLike = (s.mode == M_CUBE || s.mode == M_ROBOT);
@@ -160,19 +182,20 @@ namespace {
         const float prevY = s.y;
 
         if (!wave && !fly && s.grounded) {
-            if (!supportedNow(s, L, n, half)) {
+            if (!supportedNow(s, W, half)) {
                 s.grounded = false;
                 if (s.onSlope) s.vy = s.slope * (s.vx / 54.f);
                 s.onSlope = false;
             }
         }
 
+        // --- orb ---
         bool consumed = false;
         if (press) {
-            for (int i = 0; i < n; ++i) {
-                const Obj& o = L[i];
+            for (int i = firstIdx(W, s.x - half - 10.f); i < W.n && W.L[i].x0 <= s.x + half + 10.f; ++i) {
+                const Obj& o = W.L[i];
                 if (o.kind != Kind::Ring || isUsed(s, o.orb)) continue;
-                if (o.x0 > s.x + half + 10.f || o.x1 < s.x - half - 10.f) continue;
+                if (o.x1 < s.x - half - 10.f) continue;
                 if (ovr(s.x, s.y, half, o, 0.f)) {
                     setUsed(s, o.orb); orbFx(s, o.sub, jv, false); consumed = true; break;
                 }
@@ -181,6 +204,7 @@ namespace {
 
         float g = s.g, u = s.vy * g;
 
+        // --- moda göre giriş ---
         if (!consumed && !wave) {
             switch (s.mode) {
                 case M_CUBE:   if (s.grounded && s.held) { u = jv; s.grounded = false; s.onSlope = false; } break;
@@ -189,7 +213,7 @@ namespace {
                 case M_SPIDER:
                     if (s.grounded && press) {
                         s.g = g; s.vy = u * g;
-                        if (!spiderTeleport(s, L, n, half)) return false;
+                        if (!spiderTeleport(s, W, half)) return false;
                         g = s.g; u = s.vy * g;
                     }
                     break;
@@ -199,6 +223,7 @@ namespace {
             }
         }
 
+        // --- hız güncelle + konum ---
         if (wave) {
             float dir = (s.held ? 1.f : -1.f) * g;
             s.y += dir * dx * (s.mini ? 2.f : 1.f);
@@ -225,9 +250,10 @@ namespace {
         }
         s.x += dx;
 
+        // --- mod alanı sınırları ---
         const float lo = s.B + half, hi = s.T - half;
         if (s.y <= lo) {
-            if (cubeLike && s.g < 0.f) return false;     
+            if (cubeLike && s.g < 0.f) return false;     // ters küp zemine çarparsa ölür
             s.y = lo;
             if (!wave && s.vy < 0.f) s.vy = 0.f;
             if (s.g > 0.f && !fly && !wave) { s.grounded = true; s.onSlope = false; }
@@ -238,13 +264,15 @@ namespace {
             if (s.g < 0.f && !fly && !wave) { s.grounded = true; s.onSlope = false; }
         }
 
-        for (int i = 0; i < n; ++i) {
-            const Obj& o = L[i];
-            if (o.x0 > s.x + half + 30.f || o.x1 < s.x - half - 30.f) continue;
+        // --- objeler ---
+        for (int i = firstIdx(W, s.x - half - 30.f); i < W.n && W.L[i].x0 <= s.x + half + 30.f; ++i) {
+            const Obj& o = W.L[i];
+            if (o.x1 < s.x - half - 30.f) continue;
             switch (o.kind) {
                 case Kind::Hazard:
                     if (ovr(s.x, s.y, half, o, haz)) return false;
                     break;
+
                 case Kind::Solid:
                     if (ovr(s.x, s.y, half, o, 0.f)) {
                         if (wave) {
@@ -271,6 +299,7 @@ namespace {
                         }
                     }
                     break;
+
                 case Kind::Slope: {
                     if (wave) break;
                     const float gg = s.g;
@@ -301,13 +330,16 @@ namespace {
                     }
                     break;
                 }
+
                 case Kind::Pad:
                     if (!isUsed(s, o.orb) && ovr(s.x, s.y, half, o, 0.f)) {
                         setUsed(s, o.orb); orbFx(s, o.sub, jv, true);
                     }
                     break;
+
                 case Kind::Ring:
                     break;
+
                 case Kind::Portal:
                     if (!isUsed(s, o.orb) && ovr(s.x, s.y, half, o, 0.f)) {
                         setUsed(s, o.orb);
@@ -332,38 +364,45 @@ namespace {
         return true;
     }
 
+    // ---------------- Beam search ----------------
     struct PathLine { std::vector<CCPoint> pts; int kind = 0; };
+
     struct Node {
         S s;
         int parent = -1;
-        int tog = 0;
+        int steps = 0;       // ölüm anına kadar yaşanan toplam adım
+        float cost = 0.f;
         uint8_t act = 0;
+        uint8_t d = 0;       // bu düğümün kapsadığı adım sayısı
         bool dead = false;
         float x = 0, y = 0;
     };
+
     struct SearchOut {
         std::vector<uint8_t> plan;
         bool survived = false;
         std::vector<PathLine> lines;
     };
 
-    bool replayAlive(const S& root, const std::vector<uint8_t>& plan, size_t from,
-                     const Obj* L, int n, const Cfg& C, float margin) {
+    inline bool groundMode(int m) { return m == M_CUBE || m == M_ROBOT || m == M_BALL || m == M_SPIDER; }
+
+    bool replayAlive(const S& root, const std::vector<uint8_t>& plan, size_t from, size_t maxSteps,
+                     const World& W, const Cfg& C, float margin) {
         S s = root;
-        for (size_t i = from; i < plan.size(); ++i) {
+        size_t end = std::min(plan.size(), from + maxSteps);
+        for (size_t i = from; i < end; ++i) {
             s.prevHeld = s.held; s.held = plan[i] != 0;
-            if (!stepSim(s, L, n, C, margin)) return false;
+            if (!stepSim(s, W, C, margin)) return false;
         }
         return true;
     }
 
-    std::vector<uint8_t> extractPlan(const std::vector<Node>& nodes, int idx, int D) {
-        std::vector<uint8_t> acts;
-        for (int i = idx; i > 0; i = nodes[i].parent) acts.push_back(nodes[i].act);
-        std::reverse(acts.begin(), acts.end());
+    std::vector<uint8_t> extractPlan(const std::vector<Node>& nodes, int idx) {
+        std::vector<int> chain;
+        for (int i = idx; i > 0; i = nodes[i].parent) chain.push_back(i);
+        std::reverse(chain.begin(), chain.end());
         std::vector<uint8_t> plan;
-        plan.reserve(acts.size() * D);
-        for (uint8_t a : acts) for (int k = 0; k < D; ++k) plan.push_back(a);
+        for (int i : chain) for (int k = 0; k < nodes[i].d; ++k) plan.push_back(nodes[i].act);
         return plan;
     }
 
@@ -372,39 +411,61 @@ namespace {
         std::reverse(pl.pts.begin(), pl.pts.end());
     }
 
-    SearchOut runSearch(const S& root, const Obj* L, int n, const Cfg& C,
-                        int Kbeam, int D, int stages, bool wantLines) {
+    // Maliyet: tehdit yoksa hiçbir şey yapma (tıklama / yükseklik kaybı pahalı),
+    // gerekiyorsa en GEÇ ve en az tıklamayla çöz.
+    SearchOut runSearch(const S& root, const World& W, const Cfg& C, int Kbeam, int horizon, bool wantLines) {
         SearchOut out;
+        const int nearSteps = 144, Dnear = 3, Dfar = 5;
+        const int estStages = nearSteps / Dnear + std::max(0, horizon - nearSteps) / Dfar + 2;
         std::vector<Node> nodes;
-        nodes.reserve(static_cast<size_t>(stages) * Kbeam * 2 + 8);
+        nodes.reserve(static_cast<size_t>(estStages) * Kbeam * 2 + 8);
         Node r; r.s = root; r.act = root.held ? 1 : 0; r.x = root.x; r.y = root.y;
         nodes.push_back(r);
 
-        std::vector<int> beam{0}, cand;
-        struct Key { uint64_t k; int tog; int idx; };
+        std::vector<int> beam{0}, cand, uniq;
+        struct Key { uint64_t k; float cost; int idx; };
         std::vector<Key> keys;
-        int lastStage = 0, bestDead = -1, bestDeadStage = -1;
+        int stepsDone = 0, bestDead = -1;
 
-        for (int st = 0; st < stages; ++st) {
+        while (stepsDone < horizon) {
+            const int D = stepsDone < nearSteps ? Dnear : Dfar;
+            const float early = 30.f * static_cast<float>(horizon - stepsDone) / static_cast<float>(horizon);
             cand.clear();
             for (int bi : beam) {
                 for (int a = 0; a < 2; ++a) {
                     Node nd = nodes[bi];
-                    int act = (a == 0) ? nd.act : 1 - nd.act;
-                    nd.parent = bi; nd.tog = nodes[bi].tog + (act != nodes[bi].act ? 1 : 0);
-                    nd.act = static_cast<uint8_t>(act); nd.dead = false;
-                    for (int k = 0; k < D; ++k) {
+                    const int prevAct = nd.act;
+                    const int act = (a == 0) ? prevAct : 1 - prevAct;
+                    nd.parent = bi; nd.act = static_cast<uint8_t>(act); nd.d = static_cast<uint8_t>(D); nd.dead = false;
+                    int k = 0;
+                    for (; k < D; ++k) {
                         nd.s.prevHeld = nd.s.held; nd.s.held = act != 0;
-                        if (!stepSim(nd.s, L, n, C, 0.f)) { nd.dead = true; break; }
+                        if (!stepSim(nd.s, W, C, 0.f)) { nd.dead = true; break; }
                     }
+                    nd.steps += k;
                     nd.x = nd.s.x; nd.y = nd.s.y;
+
+                    float inc = 0.f;
+                    if (groundMode(nd.s.mode)) {
+                        if (act && !prevAct) inc += 100.f + early;      // tıklama pahalı, erken tıklama daha pahalı
+                        if (act) inc += 2.f;                            // basılı tutma
+                        if (!nd.s.grounded) inc += 0.2f * D;            // havada kalma
+                    } else {
+                        inc += std::fabs(nd.s.y - root.y) * 0.08f;      // yüksekliği koru (gereksiz inme/çıkma yok)
+                        if (act != prevAct) inc += 1.f;                 // giriş değiştirme
+                    }
+                    nd.cost += inc;
+
                     nodes.push_back(nd);
-                    int idx = static_cast<int>(nodes.size()) - 1;
-                    if (nd.dead) { if (st >= bestDeadStage) { bestDeadStage = st; bestDead = idx; } }
-                    else cand.push_back(idx);
+                    const int idx = static_cast<int>(nodes.size()) - 1;
+                    if (nd.dead) {
+                        if (bestDead < 0 || nd.steps > nodes[bestDead].steps ||
+                            (nd.steps == nodes[bestDead].steps && nd.cost < nodes[bestDead].cost)) bestDead = idx;
+                    } else cand.push_back(idx);
                 }
             }
             if (cand.empty()) break;
+            stepsDone += D;
 
             keys.clear();
             for (int idx : cand) {
@@ -415,55 +476,58 @@ namespace {
                 k = k * 1000003ull + static_cast<uint64_t>(static_cast<uint32_t>(vq + 1000000));
                 k = k * 131ull + (s.held ? 1 : 0) + (s.grounded ? 2 : 0) + (s.g > 0.f ? 4 : 0) + (s.mini ? 8 : 0) + 16ull * s.mode;
                 k ^= (s.used[0] * 0x9E3779B97F4A7C15ull) ^ (s.used[1] * 0xC2B2AE3D27D4EB4Full);
-                keys.push_back({k, nodes[idx].tog, idx});
+                keys.push_back({k, nodes[idx].cost, idx});
             }
             std::sort(keys.begin(), keys.end(), [](const Key& a, const Key& b) {
                 if (a.k != b.k) return a.k < b.k;
-                return a.tog < b.tog;
+                return a.cost < b.cost;
             });
-            beam.clear();
+            uniq.clear();
             for (size_t i = 0; i < keys.size(); ++i)
-                if (i == 0 || keys[i].k != keys[i - 1].k) beam.push_back(keys[i].idx);
-            
-            // STABİLİTE FİLTRESİ: Tehlike yoksa gereksiz zıplamayı ve dalgalanmayı engeller
-            if (static_cast<int>(beam.size()) > Kbeam) {
-                std::sort(beam.begin(), beam.end(), [&](int a, int b) {
-                    if (nodes[a].tog != nodes[b].tog) return nodes[a].tog < nodes[b].tog;
-                    if (nodes[a].s.grounded != nodes[b].s.grounded) return nodes[a].s.grounded;
-                    return std::fabs(nodes[a].s.vy) < std::fabs(nodes[b].s.vy);
+                if (i == 0 || keys[i].k != keys[i - 1].k) uniq.push_back(keys[i].idx);
+            if (static_cast<int>(uniq.size()) > Kbeam) {
+                std::sort(uniq.begin(), uniq.end(), [&](int a, int b) {
+                    if (nodes[a].cost != nodes[b].cost) return nodes[a].cost < nodes[b].cost;
+                    return a < b;
                 });
-                beam.resize(Kbeam);
+                const int keep = std::max(1, Kbeam / 2);
+                const int need = Kbeam - keep;
+                const size_t rest = uniq.size() - keep;
+                beam.assign(uniq.begin(), uniq.begin() + keep);
+                for (int i = 0; i < need; ++i) beam.push_back(uniq[keep + static_cast<size_t>(i) * rest / need]); // çeşitlilik
+            } else {
+                beam = uniq;
             }
-            lastStage = st + 1;
         }
 
         int chosen = -1;
-        if (lastStage == stages && !beam.empty()) {
+        if (stepsDone >= horizon && !beam.empty()) {
             out.survived = true;
-            std::vector<int> order = beam;
-            
-            // FİNAL KARAR STABİLİTE FİLTRESİ
-            std::sort(order.begin(), order.end(), [&](int a, int b) {
-                if (nodes[a].tog != nodes[b].tog) return nodes[a].tog < nodes[b].tog;
-                if (nodes[a].s.grounded != nodes[b].s.grounded) return nodes[a].s.grounded;
-                return std::fabs(nodes[a].s.vy) < std::fabs(nodes[b].s.vy);
-            });
-            
-            const float margins[3] = {5.f, 3.f, 1.f};
+            // Plan sonunda yerde olmak güvenlidir (iyi botların kullandığı puan)
+            std::vector<std::pair<float, int>> order;
+            for (int idx : beam) {
+                float c = nodes[idx].cost + ((groundMode(nodes[idx].s.mode) && !nodes[idx].s.grounded) ? 15.f : 0.f);
+                order.push_back({c, idx});
+            }
+            std::sort(order.begin(), order.end());
+            // En güvenli planı seç: tehlike hitbox'ını şişirerek test et (model hatası tamponu)
+            const float margins[4] = {8.f, 5.f, 3.f, 1.f};
             bool found = false;
             for (float m : margins) {
                 int tried = 0;
-                for (int idx : order) {
-                    if (++tried > 10) break;
-                    auto plan = extractPlan(nodes, idx, D);
-                    if (replayAlive(root, plan, 0, L, n, C, m)) { chosen = idx; out.plan = std::move(plan); found = true; break; }
+                for (auto& pr : order) {
+                    if (++tried > 12) break;
+                    auto plan = extractPlan(nodes, pr.second);
+                    if (replayAlive(root, plan, 0, plan.size(), W, C, m)) {
+                        chosen = pr.second; out.plan = std::move(plan); found = true; break;
+                    }
                 }
                 if (found) break;
             }
-            if (!found) { chosen = order[0]; out.plan = extractPlan(nodes, chosen, D); }
+            if (!found) { chosen = order[0].second; out.plan = extractPlan(nodes, chosen); }
         } else if (bestDead >= 0) {
             chosen = bestDead;
-            out.plan = extractPlan(nodes, chosen, D);
+            out.plan = extractPlan(nodes, chosen);
         }
 
         if (wantLines) {
@@ -479,18 +543,22 @@ namespace {
         return out;
     }
 
+    // Obje sınıflandırma (ID tabanlı: tüm orb / pad / portal)
     bool classify(int id, GameObjectType type, Obj& o) {
         switch (id) {
+            // pad
             case 35:   o.kind = Kind::Pad;  o.sub = E_YELLOW; return true;
             case 140:  o.kind = Kind::Pad;  o.sub = E_PINK;   return true;
             case 1332: o.kind = Kind::Pad;  o.sub = E_RED;    return true;
             case 67:   o.kind = Kind::Pad;  o.sub = E_BLUE;   return true;
+            // orb
             case 36:   o.kind = Kind::Ring; o.sub = E_YELLOW; return true;
             case 141:  o.kind = Kind::Ring; o.sub = E_PINK;   return true;
             case 1333: o.kind = Kind::Ring; o.sub = E_RED;    return true;
             case 84:   o.kind = Kind::Ring; o.sub = E_BLUE;   return true;
             case 1022: o.kind = Kind::Ring; o.sub = E_GREEN;  return true;
             case 1330: o.kind = Kind::Ring; o.sub = E_BLACK;  return true;
+            // mod portalları
             case 12:   o.kind = Kind::Portal; o.sub = PT_MODE; o.mode = M_CUBE;   return true;
             case 13:   o.kind = Kind::Portal; o.sub = PT_MODE; o.mode = M_SHIP;   return true;
             case 47:   o.kind = Kind::Portal; o.sub = PT_MODE; o.mode = M_BALL;   return true;
@@ -499,6 +567,7 @@ namespace {
             case 745:  o.kind = Kind::Portal; o.sub = PT_MODE; o.mode = M_ROBOT;  return true;
             case 1331: o.kind = Kind::Portal; o.sub = PT_MODE; o.mode = M_SPIDER; return true;
             case 1933: o.kind = Kind::Portal; o.sub = PT_MODE; o.mode = M_SWING;  return true;
+            // yerçekimi / boyut / hız portalları
             case 10:   o.kind = Kind::Portal; o.sub = PT_GRAV_N; return true;
             case 11:   o.kind = Kind::Portal; o.sub = PT_GRAV_F; return true;
             case 2926: o.kind = Kind::Portal; o.sub = PT_GRAV_T; return true;
@@ -525,6 +594,7 @@ namespace {
         }
     }
 
+    // Slope yüzey çizgisi: dönüş (90'ın katı) ve flip'e göre hipotenüs
     void slopeLine(GameObject* go, Obj& o) {
         int rot = static_cast<int>(std::lround(go->getRotation() / 90.f)) % 4;
         if (rot < 0) rot += 4;
@@ -546,7 +616,7 @@ namespace {
         float ratio = (qy - py) / (qx - px);
         float yline = py + (std::clamp(rx, px, qx) - px) * ratio;
         o.lx = px; o.ly = py; o.rx = qx; o.ry = qy;
-        o.sub = (ry < yline) ? 1 : 0;   
+        o.sub = (ry < yline) ? 1 : 0;   // 1: katı çizginin altında
     }
 }
 
@@ -557,6 +627,9 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         std::vector<Obj> modePortals;
         size_t cachedCount = static_cast<size_t>(-1);
         std::vector<Obj> local;
+        std::vector<float> localPm;
+        float searchMs = 1.f;
+        long lastDraw = -1000;
 
         Cfg cfg;
         float acc = 0.f;
@@ -611,8 +684,11 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
             if (o.x1 < minX) continue;
             if (o.kind == Kind::Pad || o.kind == Kind::Ring || o.kind == Kind::Portal) o.orb = orb < 128 ? static_cast<int16_t>(orb++) : -1;
             f->local.push_back(o);
-            if (f->local.size() >= 220) break;
+            if (f->local.size() >= 900) break;
         }
+        f->localPm.resize(f->local.size());
+        float m = -1e9f;
+        for (size_t i = 0; i < f->local.size(); ++i) { m = std::max(m, f->local[i].x1); f->localPm[i] = m; }
     }
 
     void clearPaths() { auto f = m_fields.self(); if (f->drawNode) f->drawNode->clear(); }
@@ -666,9 +742,8 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         auto pl = m_player1;
         if (!pl) return;
 
-        const bool active = true; // Botu kalıcı açık bırakmak istersen burayı true yaptık.
-        const bool showTraj = true; 
-        
+        const bool active = Mod::get()->getSettingValue<bool>("bot-active");
+        const bool showTraj = Mod::get()->getSettingValue<bool>("show-trajectory");
         if (!active) releaseAll();
         if (!active && !showTraj) { f->havePrev = false; clearPaths(); return; }
         if (!showTraj) clearPaths();
@@ -695,6 +770,7 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
 
         Cfg& C = f->cfg;
 
+        // ---------- canlı kalibrasyon ----------
         if (f->havePrev) {
             float vxm = (px - f->prevX) / dtp;
             if (vxm > 150.f && vxm < 800.f) f->vx = f->vx > 0.f ? f->vx * 0.7f + vxm * 0.3f : vxm;
@@ -743,58 +819,64 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         f->prevMode = mode; f->prevGrounded = grounded;
         if (f->vx <= 0.f) f->vx = 311.58f;
 
-        // Çok daha uzun bir yörünge (trajectory) için look-ahead aralığını genişlettim
-        const int horizonSteps = 300; 
-        gather(px, f->vx * (horizonSteps / 240.f) + 60.f);
+        // ---------- durum + yerel dünya ----------
+        const float look = static_cast<float>(Mod::get()->getSettingValue<double>("look-ahead"));
+        const int horizonSteps = std::clamp(static_cast<int>(look * 240.f), 120, 960);
+        gather(px, f->vx * look * 1.3f + 80.f);
         const int n = static_cast<int>(f->local.size());
-        const Obj* L = f->local.data();
+        World W{f->local.data(), f->localPm.data(), n};
 
         S root;
         root.x = px; root.y = py; root.vy = vyW; root.vx = f->vx; root.g = g;
         root.mode = static_cast<int8_t>(mode); root.mini = mini; root.grounded = grounded;
         root.held = f->held; root.prevHeld = f->held2;
         root.gb = C.groundB;
-        {   
+        {   // mod alanı: son geçilen mod portalından
             float pc = py;
             for (auto& p : f->modePortals) { if (p.x1 <= px + 1.f) pc = (p.y0 + p.y1) * 0.5f; else break; }
             areaFromCenter(root, mode, pc);
         }
-        if (grounded && !flyingMode(mode) && g > 0.f && (mode == M_CUBE || mode == M_ROBOT)) {
-            S tmp = root;
+        if (grounded && g > 0.f && (mode == M_CUBE || mode == M_ROBOT)) {
             bool onObj = false;
             float half = halfOf(root);
             for (int i = 0; i < n && !onObj; ++i) {
-                const Obj& o = L[i];
+                const Obj& o = W.L[i];
                 if ((o.kind == Kind::Solid || o.kind == Kind::Slope) && px + half > o.x0 && px - half < o.x1 &&
                     std::fabs((py - half) - o.y1) < 3.f) onObj = true;
             }
             if (!onObj) { C.groundB = py - half; root.gb = C.groundB; }
-            (void)tmp;
         }
 
+        // ---------- plan: yakın geleceği doğrula, gerekirse yeniden ara ----------
         if (!f->plan.empty()) f->planPos += steps;
-        const bool draw = showTraj;
         bool need = f->plan.empty() || f->planPos + 24 > f->plan.size();
-        if (!need) need = !replayAlive(root, f->plan, f->planPos, L, n, C, 0.f);
-        if (!need && f->tick - f->lastSearch >= 4) need = true;
+        if (!need) need = !replayAlive(root, f->plan, f->planPos, 120, W, C, 0.f);
+        const int interval = std::clamp(static_cast<int>(std::ceil(f->searchMs / 0.6f)), 6, 48);
+        if (!need && f->tick - f->lastSearch >= interval) need = true;
 
         if (need) {
-            // Trajectory (yörünge) eşzamanlı hesaplaması (Kbeam) 120'ye sabitlendi
-            int Kb = 120;
-            const int D = 3;
-            int stagesN = std::max(12, horizonSteps / D);
-            auto res = runSearch(root, L, n, C, Kb, D, stagesN, draw);
+            int Kb = std::clamp(static_cast<int>(Mod::get()->getSettingValue<int64_t>("trajectory-count")), 4, 100);
+            const bool draw = showTraj && (f->tick - f->lastDraw >= 10);
+            auto t0 = std::chrono::steady_clock::now();
+            auto res = runSearch(root, W, C, Kb, horizonSteps, draw);
+            float ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            f->searchMs = f->searchMs * 0.8f + ms * 0.2f;
             f->plan = std::move(res.plan);
             f->planPos = 0;
             f->lastSearch = f->tick;
-            if (draw) drawLines(res.lines);
+            if (draw) { drawLines(res.lines); f->lastDraw = f->tick; }
         }
 
+        // ---------- eylem ----------
         bool want = false;
         if (!f->plan.empty()) want = f->plan[std::min(f->planPos, f->plan.size() - 1)] != 0;
         if (!active) want = false;
         if (want != f->held) {
             this->handleButton(want, 1, true);
+            if (Mod::get()->getSettingValue<bool>("debug-log")) {
+                log::info("INPUT {} mode={} x={:.1f} y={:.1f} vy={:.2f} vx={:.1f} gMult={:.3f} jumpV={:.2f} searchMs={:.2f}",
+                          want ? "DOWN" : "UP", mode, px, py, vyW, f->vx, C.gMult[mode], C.jumpV, f->searchMs);
+            }
         }
         f->held2 = f->held;
         f->held = want;
@@ -816,7 +898,7 @@ class $modify(CubeBotPause, PauseLayer) {
 
         auto toggler = CCMenuItemToggler::createWithStandardSprites(
             this, menu_selector(CubeBotPause::onToggleBot), 0.7f);
-        toggler->toggle(true);
+        toggler->toggle(Mod::get()->getSettingValue<bool>("bot-active"));
         toggler->setPosition({30.f, 30.f});
         menu->addChild(toggler);
 
@@ -830,5 +912,8 @@ class $modify(CubeBotPause, PauseLayer) {
     }
 
     void onToggleBot(CCObject* sender) {
+        auto t = static_cast<CCMenuItemToggler*>(sender);
+        bool newValue = !t->isToggled();   // callback anında eski durum
+        Mod::get()->setSettingValue<bool>("bot-active", newValue);
     }
 };
