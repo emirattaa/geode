@@ -1,16 +1,27 @@
-// Geode Autoplay v0.5 - tüm modlar, orb/pad/portal/slope, 30 yörünge beam search
+// Geode Autoplay v0.7 - tüm modlar, orb/pad/portal/slope, beam search planlama
+//
+// v0.6 -> v0.7 değişiklikleri:
+//  * [ANA BUG] Her yeniden planlamada kök durumun "kullanılmış" bitleri sıfırdı. Oyuncunun içinde durduğu
+//    pad / portal simülasyonda TEKRAR tetikleniyordu (gravity-toggle portalı iki kez çeviriyor, pad tekrar
+//    fırlatıyor, plan çöpe dönüyordu). Artık üstündeki pad/portal ve botun tıkladığı ring'ler kullanılmış sayılır.
+//  * Dikey konum ölçeği (kPos) oyundan canlı kalibre edilir. Eski sabit 0.225 yanlışsa zıplama yüksekliği/süresi
+//    kayıyordu; yerçekimi kalibrasyonu da aynı ölçeğe bağlandı.
+//  * Zemin (groundB) kalibrasyonu artık bir platformun üstünde yanlışlıkla bozulmuyor; ve alan hesabından ÖNCE yapılıyor.
+//  * Hız (vx) hız portallarından sonra anında doğru okunuyor (eskiden EMA gecikmesi vardı).
+//  * Robot zıplama sayacı gerçek oyundan takip ediliyor.
+//  * Beam search: tamponlar yeniden kullanılıyor (kare takılması azalır), daha iyi hash, önceki plana yapışma
+//    (titreşen giriş azalır), "güvenlik payı" ayarı, bot kapalıyken sadece çizim için seyrek arama.
+//  * Yerel dünya her adımda değil, gerektiğinde toplanıyor (CPU); limit 900 -> 2500 obje.
+//  * used bit sayısı 128 -> 256.
 //
 // Fizik kaynakları (GD 2.2081 decompile'larından türetilmiş, topluluk projeleri):
-//  - 240 Hz adım, hız birimi: 1 birim = 0.225 koordinat/adım (54 u/s)
+//  - 240 Hz adım, hız birimi: 1 birim = kPos koordinat/adım (varsayılan 0.225, canlı ölçülür)
 //  - küp zıplama 11.18, yerçekimi 0.958199/adım, terminal hız 15
 //  - ball/spider yerçekimi x0.6, robot x0.9, swing x0.4, mini zıplama x0.8
 //  - ship limit +8/-6.4, ufo zıplama 7, wave 45 derece (mini 2:1)
 //  - hitbox: oyuncu 30 (mini 18), wave 10, spider 27; iç hitbox 0.3x;
 //    diken dış hitbox ile öldürür; blok iniş toleransı 10 (uçan modlar 6)
-// Değerler oyundan CANLI ölçülerek kalibre edilir (yerçekimi, zıplama, ship ivmesi, hız).
-//
-// Planlama: her ~8 adımda beam search (K yörünge) -> en güvenli giriş planı seçilir.
-// Plan her adımda gerçek durumdan yeniden doğrulanır; bozulursa anında yeniden aranır.
+// Değerler oyundan CANLI ölçülerek kalibre edilir (yerçekimi, zıplama, ship ivmesi, hız, konum ölçeği).
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
@@ -20,15 +31,17 @@
 #include <cmath>
 #include <chrono>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 using namespace geode::prelude;
 
 namespace {
-    constexpr float K       = 0.225f;       // hız birimi -> koordinat / adım
+    constexpr float K       = 0.225f;       // hız birimi -> koordinat / adım (varsayılan; Cfg::kPos canlı ölçülür)
     constexpr float G0      = 0.958199f;
     constexpr float kStepDt = 1.f / 240.f;
     constexpr float kInf    = 1e9f;
+    constexpr int   kMaxOrb = 256;          // plan penceresindeki pad/ring/portal sayısı sınırı
 
     enum Mode : int { M_CUBE = 0, M_SHIP, M_BALL, M_UFO, M_WAVE, M_ROBOT, M_SPIDER, M_SWING, M_COUNT };
     enum class Kind : uint8_t { Hazard, Solid, Slope, Pad, Ring, Portal };
@@ -53,6 +66,7 @@ namespace {
         float shipAcc[4] = {0.4f * G0 * K, 0.5f * G0 * K, 1.2f * 0.4f * G0 * K, 0.8f * 0.4f * G0 * K};
         float shipUp = 8.f, shipDown = 6.4f;
         float groundB = 90.f;
+        float kPos = K;       // koordinat / (hız birimi * adım)
     };
 
     struct S {
@@ -64,7 +78,7 @@ namespace {
         int8_t mode = 0;
         int16_t robotBoost = 0;
         bool mini = false, grounded = true, held = false, prevHeld = false, onSlope = false;
-        uint64_t used[2] = {0, 0};
+        uint64_t used[kMaxOrb / 64] = {0, 0, 0, 0};
     };
 
     inline bool flyingMode(int m) { return m == M_SHIP || m == M_UFO || m == M_WAVE || m == M_SWING; }
@@ -80,8 +94,16 @@ namespace {
     inline bool ovr(float x, float y, float h, const Obj& o, float pad) {
         return x - h < o.x1 + pad && x + h > o.x0 - pad && y - h < o.y1 + pad && y + h > o.y0 - pad;
     }
-    inline bool isUsed(const S& s, int i) { return i >= 0 && ((s.used[i >> 6] >> (i & 63)) & 1ull); }
-    inline void setUsed(S& s, int i) { if (i >= 0) s.used[i >> 6] |= (1ull << (i & 63)); }
+    inline bool isUsed(const S& s, int i) {
+        return i >= 0 && i < kMaxOrb && ((s.used[i >> 6] >> (i & 63)) & 1ull);
+    }
+    inline void setUsed(S& s, int i) {
+        if (i >= 0 && i < kMaxOrb) s.used[i >> 6] |= (1ull << (i & 63));
+    }
+    inline float slopeRatio(const Obj& o) {
+        const float w = o.rx - o.lx;
+        return std::fabs(w) < 1e-3f ? 0.f : (o.ry - o.ly) / w;
+    }
 
     // x'e göre sıralı obje listesi + x1 için kümülatif maksimum (ikili arama ile hızlı aralık)
     struct World { const Obj* L; const float* pm; int n; };
@@ -131,7 +153,7 @@ namespace {
                 }
             } else if (o.kind == Kind::Slope) {
                 if ((g > 0.f) != (o.sub == 1)) continue;
-                float ratio = (o.ry - o.ly) / (o.rx - o.lx);
+                float ratio = slopeRatio(o);
                 float xc = ((g > 0.f) == (ratio > 0.f)) ? s.x + half : s.x - half;
                 if (xc >= o.lx - 0.5f && xc <= o.rx + 0.5f) {
                     float ys = o.ly + (std::clamp(xc, o.lx, o.rx) - o.lx) * ratio;
@@ -176,7 +198,7 @@ namespace {
         const float inner = half * 0.3f;
         const float snap = fly ? 6.f : 10.f;
         const float dx = s.vx / 240.f;
-        const float gstep = G0 * K;
+        const float gstep = G0 * C.kPos;
         const float jv = C.jumpV * (s.mini ? 0.8f : 1.f);
         const bool press = s.held && !s.prevHeld;
         const float prevY = s.y;
@@ -184,7 +206,7 @@ namespace {
         if (!wave && !fly && s.grounded) {
             if (!supportedNow(s, W, half)) {
                 s.grounded = false;
-                if (s.onSlope) s.vy = s.slope * (s.vx / 54.f);
+                if (s.onSlope) s.vy = s.slope * (s.vx / (240.f * C.kPos));
                 s.onSlope = false;
             }
         }
@@ -246,7 +268,7 @@ namespace {
                 }
             }
             s.g = g; s.vy = u * g;
-            if (!s.grounded) s.y += s.vy * K;
+            if (!s.grounded) s.y += s.vy * C.kPos;
         }
         s.x += dx;
 
@@ -304,7 +326,7 @@ namespace {
                     if (wave) break;
                     const float gg = s.g;
                     const bool floorSide = (gg > 0.f) == (o.sub == 1);
-                    const float ratio = (o.ry - o.ly) / (o.rx - o.lx);
+                    const float ratio = slopeRatio(o);
                     if (floorSide) {
                         float xc = ((gg > 0.f) == (ratio > 0.f)) ? s.x + half : s.x - half;
                         if (xc >= o.lx - 0.5f && xc <= o.rx + 0.5f) {
@@ -384,7 +406,37 @@ namespace {
         std::vector<PathLine> lines;
     };
 
+    struct BeamKey { uint64_t k; float cost; int idx; };
+
+    // Arama tamponları: her aramada yeniden ayırmak yerine tekrar kullanılır
+    struct SearchBuf {
+        std::vector<Node> nodes;
+        std::vector<int> beam, cand, uniq;
+        std::vector<BeamKey> keys;
+        std::vector<std::pair<float, int>> order;
+    };
+
     inline bool groundMode(int m) { return m == M_CUBE || m == M_ROBOT || m == M_BALL || m == M_SPIDER; }
+
+    inline uint64_t mix64(uint64_t x) {
+        x ^= x >> 33; x *= 0xff51afd7ed558ccdull;
+        x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ull;
+        x ^= x >> 33;
+        return x;
+    }
+
+    uint64_t stateKey(const S& s) {
+        const int yq = static_cast<int>(std::floor(s.y / 3.f));
+        const int vq = static_cast<int>(std::lround(s.vy * 3.f));
+        uint64_t flags = (s.held ? 1u : 0u) | (s.grounded ? 2u : 0u) | (s.g > 0.f ? 4u : 0u) |
+                         (s.mini ? 8u : 0u) | (s.onSlope ? 16u : 0u) | (s.robotBoost > 0 ? 32u : 0u) |
+                         (static_cast<uint64_t>(s.mode) << 8);
+        uint64_t k = mix64(static_cast<uint64_t>(static_cast<uint32_t>(yq + 1000000)));
+        k = mix64(k ^ (static_cast<uint64_t>(static_cast<uint32_t>(vq + 1000000)) << 1));
+        k = mix64(k ^ (flags * 0x9E3779B97F4A7C15ull));
+        for (uint64_t w : s.used) k = mix64(k ^ w);
+        return k;
+    }
 
     bool replayAlive(const S& root, const std::vector<uint8_t>& plan, size_t from, size_t maxSteps,
                      const World& W, const Cfg& C, float margin) {
@@ -412,24 +464,33 @@ namespace {
     }
 
     // Maliyet: tehdit yoksa hiçbir şey yapma (tıklama / yükseklik kaybı pahalı),
-    // gerekiyorsa en GEÇ ve en az tıklamayla çöz.
-    SearchOut runSearch(const S& root, const World& W, const Cfg& C, int Kbeam, int horizon, bool wantLines) {
+    // gerekiyorsa en GEÇ ve en az tıklamayla çöz. hint: önceki plan (aynı kararlara hafif yapışır).
+    SearchOut runSearch(const S& root, const World& W, const Cfg& C, int Kbeam, int horizon, bool wantLines,
+                        float marginBase, const std::vector<uint8_t>* hint, size_t hintPos) {
         SearchOut out;
+        static thread_local SearchBuf B;
+        auto& nodes = B.nodes;
+        auto& beam = B.beam;
+        auto& cand = B.cand;
+        auto& uniq = B.uniq;
+        auto& keys = B.keys;
+
         const int nearSteps = 144, Dnear = 3, Dfar = 5;
         const int estStages = nearSteps / Dnear + std::max(0, horizon - nearSteps) / Dfar + 2;
-        std::vector<Node> nodes;
-        nodes.reserve(static_cast<size_t>(estStages) * Kbeam * 2 + 8);
+        const size_t want = static_cast<size_t>(estStages) * Kbeam * 2 + 8;
+        nodes.clear();
+        if (nodes.capacity() < want) nodes.reserve(want);
         Node r; r.s = root; r.act = root.held ? 1 : 0; r.x = root.x; r.y = root.y;
         nodes.push_back(r);
 
-        std::vector<int> beam{0}, cand, uniq;
-        struct Key { uint64_t k; float cost; int idx; };
-        std::vector<Key> keys;
+        beam.assign(1, 0); cand.clear(); uniq.clear(); keys.clear();
         int stepsDone = 0, bestDead = -1;
 
         while (stepsDone < horizon) {
             const int D = stepsDone < nearSteps ? Dnear : Dfar;
             const float early = 30.f * static_cast<float>(horizon - stepsDone) / static_cast<float>(horizon);
+            const bool hintOk = hint && hintPos + static_cast<size_t>(stepsDone) < hint->size();
+            const int hintAct = hintOk ? ((*hint)[hintPos + static_cast<size_t>(stepsDone)] != 0 ? 1 : 0) : -1;
             cand.clear();
             for (int bi : beam) {
                 for (int a = 0; a < 2; ++a) {
@@ -450,10 +511,13 @@ namespace {
                         if (act && !prevAct) inc += 100.f + early;      // tıklama pahalı, erken tıklama daha pahalı
                         if (act) inc += 2.f;                            // basılı tutma
                         if (!nd.s.grounded) inc += 0.2f * D;            // havada kalma
+                        // açık havada (tavansız) çok yükseğe uçmak gerçek oyunda ölümdür: ucuza kaçış yolu sayma
+                        if (nd.s.T >= kInf * 0.5f && nd.s.y > nd.s.gb + 450.f) inc += 20.f;
                     } else {
                         inc += std::fabs(nd.s.y - root.y) * 0.08f;      // yüksekliği koru (gereksiz inme/çıkma yok)
                         if (act != prevAct) inc += 1.f;                 // giriş değiştirme
                     }
+                    if (hintAct >= 0 && act != hintAct) inc += 3.f;     // önceki plandan sapma: küçük ceza (titreşim azaltır)
                     nd.cost += inc;
 
                     nodes.push_back(nd);
@@ -468,19 +532,11 @@ namespace {
             stepsDone += D;
 
             keys.clear();
-            for (int idx : cand) {
-                const S& s = nodes[idx].s;
-                int yq = static_cast<int>(std::floor(s.y / 3.f));
-                int vq = static_cast<int>(std::lround(s.vy * 3.f));
-                uint64_t k = static_cast<uint64_t>(static_cast<uint32_t>(yq + 1000000));
-                k = k * 1000003ull + static_cast<uint64_t>(static_cast<uint32_t>(vq + 1000000));
-                k = k * 131ull + (s.held ? 1 : 0) + (s.grounded ? 2 : 0) + (s.g > 0.f ? 4 : 0) + (s.mini ? 8 : 0) + 16ull * s.mode;
-                k ^= (s.used[0] * 0x9E3779B97F4A7C15ull) ^ (s.used[1] * 0xC2B2AE3D27D4EB4Full);
-                keys.push_back({k, nodes[idx].cost, idx});
-            }
-            std::sort(keys.begin(), keys.end(), [](const Key& a, const Key& b) {
+            for (int idx : cand) keys.push_back({stateKey(nodes[idx].s), nodes[idx].cost, idx});
+            std::sort(keys.begin(), keys.end(), [](const BeamKey& a, const BeamKey& b) {
                 if (a.k != b.k) return a.k < b.k;
-                return a.cost < b.cost;
+                if (a.cost != b.cost) return a.cost < b.cost;
+                return a.idx < b.idx;
             });
             uniq.clear();
             for (size_t i = 0; i < keys.size(); ++i)
@@ -504,19 +560,20 @@ namespace {
         if (stepsDone >= horizon && !beam.empty()) {
             out.survived = true;
             // Plan sonunda yerde olmak güvenlidir (iyi botların kullandığı puan)
-            std::vector<std::pair<float, int>> order;
+            auto& order = B.order;
+            order.clear();
             for (int idx : beam) {
                 float c = nodes[idx].cost + ((groundMode(nodes[idx].s.mode) && !nodes[idx].s.grounded) ? 15.f : 0.f);
                 order.push_back({c, idx});
             }
             std::sort(order.begin(), order.end());
             // En güvenli planı seç: tehlike hitbox'ını şişirerek test et (model hatası tamponu)
-            const float margins[4] = {8.f, 5.f, 3.f, 1.f};
+            const float margins[4] = {marginBase, marginBase * 0.6f, marginBase * 0.35f, marginBase * 0.12f};
             bool found = false;
             for (float m : margins) {
                 int tried = 0;
                 for (auto& pr : order) {
-                    if (++tried > 12) break;
+                    if (++tried > 16) break;
                     auto plan = extractPlan(nodes, pr.second);
                     if (replayAlive(root, plan, 0, plan.size(), W, C, m)) {
                         chosen = pr.second; out.plan = std::move(plan); found = true; break;
@@ -531,9 +588,13 @@ namespace {
         }
 
         if (wantLines) {
-            for (int idx : beam) { PathLine pl; pl.kind = 0; chainPoints(nodes, idx, pl); out.lines.push_back(std::move(pl)); }
+            int shown = 0;
+            for (int idx : beam) {
+                if (shown++ >= 14) break;
+                PathLine pl; pl.kind = 0; chainPoints(nodes, idx, pl); out.lines.push_back(std::move(pl));
+            }
             int deadShown = 0;
-            for (int i = static_cast<int>(nodes.size()) - 1; i > 0 && deadShown < 14; --i) {
+            for (int i = static_cast<int>(nodes.size()) - 1; i > 0 && deadShown < 8; --i) {
                 if (!nodes[i].dead) continue;
                 PathLine pl; pl.kind = 1; chainPoints(nodes, i, pl);
                 out.lines.push_back(std::move(pl)); ++deadShown;
@@ -628,10 +689,12 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         size_t cachedCount = static_cast<size_t>(-1);
         std::vector<Obj> local;
         std::vector<float> localPm;
+        float gatherX = -1e9f, gatherReach = 0.f;
         float searchMs = 1.f;
         long lastDraw = -1000;
 
         Cfg cfg;
+        bool groundKnown = false;
         float acc = 0.f;
         bool havePrev = false;
         float prevX = 0.f, prevY = 0.f, prevVyW = 0.f, prevG = 1.f;
@@ -641,6 +704,8 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         bool held = false, held2 = false;
         float flipSign = 1.f;
         int flipEvid = 0;
+        int robotBoost = 0;
+        std::vector<std::pair<float, float>> usedRings;   // botun tıkladığı ring'ler (x0, y0)
 
         long tick = 0;
         long lastSearch = -1000;
@@ -653,6 +718,8 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
     void rebuildCache() {
         auto f = m_fields.self();
         f->objs.clear(); f->prefMax.clear(); f->modePortals.clear();
+        f->local.clear(); f->localPm.clear();
+        f->gatherX = -1e9f; f->gatherReach = 0.f;
         f->cachedCount = m_objects ? m_objects->count() : 0;
         if (!m_objects) return;
         for (auto go : CCArrayExt<GameObject*>(m_objects)) {
@@ -676,15 +743,16 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
     void gather(float px, float reachX) {
         auto f = m_fields.self();
         f->local.clear();
+        f->gatherX = px; f->gatherReach = reachX;
         float minX = px - 45.f, maxX = px + reachX + 45.f;
         size_t start = std::lower_bound(f->prefMax.begin(), f->prefMax.end(), minX) - f->prefMax.begin();
         int orb = 0;
         for (size_t i = start; i < f->objs.size() && f->objs[i].x0 <= maxX; ++i) {
             Obj o = f->objs[i];
             if (o.x1 < minX) continue;
-            if (o.kind == Kind::Pad || o.kind == Kind::Ring || o.kind == Kind::Portal) o.orb = orb < 128 ? static_cast<int16_t>(orb++) : -1;
+            if (o.kind == Kind::Pad || o.kind == Kind::Ring || o.kind == Kind::Portal) o.orb = orb < kMaxOrb ? static_cast<int16_t>(orb++) : -1;
             f->local.push_back(o);
-            if (f->local.size() >= 900) break;
+            if (f->local.size() >= 2500) break;
         }
         f->localPm.resize(f->local.size());
         float m = -1e9f;
@@ -723,6 +791,7 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
     void resetBotState() {
         auto f = m_fields.self();
         f->havePrev = false; f->plan.clear(); f->planPos = 0; f->lastSearch = -1000; f->acc = 0.f;
+        f->usedRings.clear(); f->robotBoost = 0;
         releaseAll();
     }
 
@@ -735,6 +804,13 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         if (p->m_isSpider) return M_SPIDER;
         if (p->m_isSwing) return M_SWING;
         return M_CUBE;
+    }
+
+    bool ringUsed(const Obj& o) {
+        auto f = m_fields.self();
+        for (auto& p : f->usedRings)
+            if (std::fabs(p.first - o.x0) < 0.05f && std::fabs(p.second - o.y0) < 0.05f) return true;
+        return false;
     }
 
     void runBot(float dt) {
@@ -769,11 +845,16 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         if (f->havePrev && px < f->prevX - 1.f) resetBotState();
 
         Cfg& C = f->cfg;
+        const bool debug = Mod::get()->getSettingValue<bool>("debug-log");
 
         // ---------- canlı kalibrasyon ----------
         if (f->havePrev) {
+            // yatay hız: konum farkından doğrudan oku (hız portalından sonra anında doğru)
             float vxm = (px - f->prevX) / dtp;
-            if (vxm > 150.f && vxm < 800.f) f->vx = f->vx > 0.f ? f->vx * 0.7f + vxm * 0.3f : vxm;
+            if (vxm > 150.f && vxm < 800.f) {
+                if (f->vx <= 0.f || std::fabs(vxm - f->vx) > 25.f) f->vx = vxm;
+                else f->vx = f->vx * 0.5f + vxm * 0.5f;
+            }
 
             if (g < 0.f && f->prevG < 0.f && !grounded && !f->prevGrounded) {
                 float dy = py - f->prevY;
@@ -788,7 +869,16 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
             const bool pressed = f->held && !f->held2;
             const bool airborne = !grounded && !f->prevGrounded;
             const float duU = (vyW - f->prevVyW) * g;
-            const float gstep = G0 * K;
+            const float gstep = G0 * C.kPos;
+
+            // dikey konum ölçeği: dy = kPos * ortalama hız (yalnızca pürüzsüz havada kalma adımlarında)
+            if (sameState && airborne && mode != M_WAVE && std::fabs(vyW - f->prevVyW) < 0.6f) {
+                float vAvg = 0.5f * (vyW + f->prevVyW);
+                if (std::fabs(vAvg) > 2.f) {
+                    float ke = (py - f->prevY) / vAvg;
+                    if (ke > 0.15f && ke < 0.35f) C.kPos = C.kPos * 0.95f + ke * 0.05f;
+                }
+            }
 
             if (sameState && airborne && !pressed && mode != M_SHIP && mode != M_WAVE) {
                 bool boosting = (mode == M_ROBOT && f->held);
@@ -814,6 +904,16 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
                 if (um > 4.f && um < 12.f) C.ufoV = C.ufoV * 0.5f + um * 0.5f;
             }
         }
+
+        // robot zıplama sayacı (simülasyonun kök durumu için)
+        if (mode == M_ROBOT) {
+            if (f->prevMode == M_ROBOT && f->prevGrounded && !grounded && f->held) f->robotBoost = std::max(0, 67 - steps);
+            else if (f->robotBoost > 0 && f->held && !grounded) f->robotBoost = std::max(0, f->robotBoost - steps);
+            else f->robotBoost = 0;
+        } else {
+            f->robotBoost = 0;
+        }
+
         f->havePrev = true;
         f->prevX = px; f->prevY = py; f->prevVyW = vyW; f->prevG = g;
         f->prevMode = mode; f->prevGrounded = grounded;
@@ -822,7 +922,9 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         // ---------- durum + yerel dünya ----------
         const float look = static_cast<float>(Mod::get()->getSettingValue<double>("look-ahead"));
         const int horizonSteps = std::clamp(static_cast<int>(look * 240.f), 120, 960);
-        gather(px, f->vx * look * 1.3f + 80.f);
+        const float reach = f->vx * look * 1.3f + 80.f;
+        if (f->gatherReach <= 0.f || px < f->gatherX || px > f->gatherX + 150.f || reach > f->gatherReach - 150.f)
+            gather(px, reach + 200.f);
         const int n = static_cast<int>(f->local.size());
         World W{f->local.data(), f->localPm.data(), n};
 
@@ -830,21 +932,44 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         root.x = px; root.y = py; root.vy = vyW; root.vx = f->vx; root.g = g;
         root.mode = static_cast<int8_t>(mode); root.mini = mini; root.grounded = grounded;
         root.held = f->held; root.prevHeld = f->held2;
+        root.robotBoost = static_cast<int16_t>(f->robotBoost);
+        const float halfNow = halfOf(root);
+
+        // zemin kalibrasyonu (mod alanından ÖNCE; yalnızca gerçek zemindeyken ve küçük kaymalarla)
+        if (grounded && g > 0.f && (mode == M_CUBE || mode == M_ROBOT)) {
+            bool onObj = false;
+            for (int i = 0; i < n && !onObj; ++i) {
+                const Obj& o = W.L[i];
+                if ((o.kind == Kind::Solid || o.kind == Kind::Slope) && px + halfNow > o.x0 && px - halfNow < o.x1 &&
+                    std::fabs((py - halfNow) - o.y1) < 3.f) onObj = true;
+            }
+            if (!onObj) {
+                float gbm = py - halfNow;
+                if (std::fabs(gbm - C.groundB) < 4.f || (!f->groundKnown && std::fabs(gbm - 90.f) < 200.f)) {
+                    C.groundB = gbm; f->groundKnown = true;
+                }
+            }
+        }
         root.gb = C.groundB;
         {   // mod alanı: son geçilen mod portalından
             float pc = py;
             for (auto& p : f->modePortals) { if (p.x1 <= px + 1.f) pc = (p.y0 + p.y1) * 0.5f; else break; }
             areaFromCenter(root, mode, pc);
         }
-        if (grounded && g > 0.f && (mode == M_CUBE || mode == M_ROBOT)) {
-            bool onObj = false;
-            float half = halfOf(root);
-            for (int i = 0; i < n && !onObj; ++i) {
-                const Obj& o = W.L[i];
-                if ((o.kind == Kind::Solid || o.kind == Kind::Slope) && px + half > o.x0 && px - half < o.x1 &&
-                    std::fabs((py - half) - o.y1) < 3.f) onObj = true;
+
+        // Oyuncunun şu an içinde olduğu pad/portal ve botun tıkladığı ring'ler oyunda ZATEN tetiklendi:
+        // kök durumda "kullanılmış" işaretle ki simülasyon onları ikinci kez tetiklemesin.
+        {
+            for (const Obj& o : f->local) {
+                if (o.x0 > px + halfNow + 2.f) break;
+                if (o.orb < 0 || o.x1 < px - halfNow - 2.f) continue;
+                bool used = false;
+                if (o.kind == Kind::Pad || o.kind == Kind::Portal) used = ovr(px, py, halfNow, o, 0.5f);
+                else if (o.kind == Kind::Ring) used = ringUsed(o);
+                if (used) setUsed(root, o.orb);
             }
-            if (!onObj) { C.groundB = py - half; root.gb = C.groundB; }
+            auto& ur = f->usedRings;
+            ur.erase(std::remove_if(ur.begin(), ur.end(), [&](const std::pair<float, float>& p) { return p.first < px - 300.f; }), ur.end());
         }
 
         // ---------- plan: yakın geleceği doğrula, gerekirse yeniden ara ----------
@@ -853,12 +978,17 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         if (!need) need = !replayAlive(root, f->plan, f->planPos, 120, W, C, 0.f);
         const int interval = std::clamp(static_cast<int>(std::ceil(f->searchMs / 0.6f)), 6, 48);
         if (!need && f->tick - f->lastSearch >= interval) need = true;
+        // bot kapalıyken sadece çizim için, seyrek ara
+        if (!active) need = showTraj && (f->tick - f->lastDraw >= 12);
 
         if (need) {
             int Kb = std::clamp(static_cast<int>(Mod::get()->getSettingValue<int64_t>("trajectory-count")), 4, 100);
-            const bool draw = showTraj && (f->tick - f->lastDraw >= 10);
+            if (f->searchMs > 12.f) Kb = std::max(8, static_cast<int>(Kb * 12.f / f->searchMs));   // yavaşsa otomatik küçült
+            const float marginBase = std::clamp(static_cast<float>(Mod::get()->getSettingValue<double>("safety-margin")), 0.f, 14.f);
+            const bool draw = showTraj && (f->tick - f->lastDraw >= 12);
             auto t0 = std::chrono::steady_clock::now();
-            auto res = runSearch(root, W, C, Kb, horizonSteps, draw);
+            auto res = runSearch(root, W, C, Kb, horizonSteps, draw, marginBase,
+                                 f->plan.empty() ? nullptr : &f->plan, f->planPos);
             float ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
             f->searchMs = f->searchMs * 0.8f + ms * 0.2f;
             f->plan = std::move(res.plan);
@@ -873,9 +1003,18 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         if (!active) want = false;
         if (want != f->held) {
             this->handleButton(want, 1, true);
-            if (Mod::get()->getSettingValue<bool>("debug-log")) {
-                log::info("INPUT {} mode={} x={:.1f} y={:.1f} vy={:.2f} vx={:.1f} gMult={:.3f} jumpV={:.2f} searchMs={:.2f}",
-                          want ? "DOWN" : "UP", mode, px, py, vyW, f->vx, C.gMult[mode], C.jumpV, f->searchMs);
+            if (want) {   // yeni basış: üstünde olduğumuz ilk ring'i kullanılmış say (simülasyonla aynı sıra)
+                for (const Obj& o : f->local) {
+                    if (o.x0 > px + halfNow + 10.f) break;
+                    if (o.kind == Kind::Ring && !ringUsed(o) && ovr(px, py, halfNow, o, 0.f)) {
+                        f->usedRings.push_back({o.x0, o.y0});
+                        break;
+                    }
+                }
+            }
+            if (debug) {
+                log::info("INPUT {} mode={} x={:.1f} y={:.1f} vy={:.2f} vx={:.1f} gMult={:.3f} jumpV={:.2f} kPos={:.4f} searchMs={:.2f}",
+                          want ? "DOWN" : "UP", mode, px, py, vyW, f->vx, C.gMult[mode], C.jumpV, C.kPos, f->searchMs);
             }
         }
         f->held2 = f->held;
