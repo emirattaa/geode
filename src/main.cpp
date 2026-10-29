@@ -1,4 +1,12 @@
-// Geode Autoplay v0.7 - tüm modlar, orb/pad/portal/slope, beam search planlama
+// Geode Autoplay v0.8 - tüm modlar, orb/pad/portal/slope, beam search planlama
+//
+// v0.7 -> v0.8 değişiklikleri:
+//  * SON ANDA ATLAMA düzeltildi: arama artık tehlikeye olan mesafeyi (clearance) ölçüyor, tehlikeye yaklaşmayı cezalandırıyor
+//    ve eski "geç tıkla" önyargısı kaldırıldı. Son plan, en geniş boşluğu bırakan adaydan seçiliyor.
+//  * UZAK SİMÜLASYON: bakış süresi 10 saniyeye (2400 adım) çıktı. Uzak kısım çok çözünürlüklü aranır (3/5/10/20 adım).
+//    Seçilen yol artık adım adım yeniden oynatılıp pürüzsüz ve uzun çizilir.
+//  * WAVE: slope'lar artık simülasyonda var (wave üstünden kayar, eskiden içinden geçiyordu); yan çarpma toleransı
+//    daraltıldı; wave/ship için daha ince giriş adımı (1/2 adım) kullanılır.
 //
 // v0.6 -> v0.7 değişiklikleri:
 //  * [ANA BUG] Her yeniden planlamada kök durumun "kullanılmış" bitleri sıfırdı. Oyuncunun içinde durduğu
@@ -11,8 +19,8 @@
 //  * Robot zıplama sayacı gerçek oyundan takip ediliyor.
 //  * Beam search: tamponlar yeniden kullanılıyor (kare takılması azalır), daha iyi hash, önceki plana yapışma
 //    (titreşen giriş azalır), "güvenlik payı" ayarı, bot kapalıyken sadece çizim için seyrek arama.
-//  * Yerel dünya her adımda değil, gerektiğinde toplanıyor (CPU); limit 900 -> 2500 obje.
-//  * used bit sayısı 128 -> 256.
+//  * Yerel dünya her adımda değil, gerektiğinde toplanıyor (CPU); limit 900 -> 12000 obje.
+//  * used bit sayısı 128 -> 512.
 //
 // Fizik kaynakları (GD 2.2081 decompile'larından türetilmiş, topluluk projeleri):
 //  - 240 Hz adım, hız birimi: 1 birim = kPos koordinat/adım (varsayılan 0.225, canlı ölçülür)
@@ -41,7 +49,7 @@ namespace {
     constexpr float G0      = 0.958199f;
     constexpr float kStepDt = 1.f / 240.f;
     constexpr float kInf    = 1e9f;
-    constexpr int   kMaxOrb = 256;          // plan penceresindeki pad/ring/portal sayısı sınırı
+    constexpr int   kMaxOrb = 512;          // plan penceresindeki pad/ring/portal sayısı sınırı
 
     enum Mode : int { M_CUBE = 0, M_SHIP, M_BALL, M_UFO, M_WAVE, M_ROBOT, M_SPIDER, M_SWING, M_COUNT };
     enum class Kind : uint8_t { Hazard, Solid, Slope, Pad, Ring, Portal };
@@ -78,7 +86,8 @@ namespace {
         int8_t mode = 0;
         int16_t robotBoost = 0;
         bool mini = false, grounded = true, held = false, prevHeld = false, onSlope = false;
-        uint64_t used[kMaxOrb / 64] = {0, 0, 0, 0};
+        float clr = kInf;            // tehlikeye en yakın ayrılık (birim); sadece planlama için
+        uint64_t used[kMaxOrb / 64] = {};
     };
 
     inline bool flyingMode(int m) { return m == M_SHIP || m == M_UFO || m == M_WAVE || m == M_SWING; }
@@ -291,9 +300,14 @@ namespace {
             const Obj& o = W.L[i];
             if (o.x1 < s.x - half - 30.f) continue;
             switch (o.kind) {
-                case Kind::Hazard:
+                case Kind::Hazard: {
                     if (ovr(s.x, s.y, half, o, haz)) return false;
+                    const float sx = std::max(o.x0 - (s.x + half), (s.x - half) - o.x1);
+                    const float sy = std::max(o.y0 - (s.y + half), (s.y - half) - o.y1);
+                    const float sep = std::max(sx, sy);
+                    if (sep < s.clr) s.clr = sep;
                     break;
+                }
 
                 case Kind::Solid:
                     if (ovr(s.x, s.y, half, o, 0.f)) {
@@ -301,7 +315,7 @@ namespace {
                             float prevFeet = prevY - half, prevHead = prevY + half;
                             if (s.y < prevY && prevFeet >= o.y1 - snap)      s.y = o.y1 + half;
                             else if (s.y > prevY && prevHead <= o.y0 + snap) s.y = o.y0 - half;
-                            else if (ovr(s.x, s.y, inner, o, haz * 0.5f)) return false;
+                            else if (ovr(s.x, s.y, half * 0.8f, o, haz * 0.5f)) return false;   // wave: yan çarpma toleransı dar
                         } else {
                             const float gg = s.g;
                             const float uu = s.vy * gg;
@@ -323,10 +337,27 @@ namespace {
                     break;
 
                 case Kind::Slope: {
-                    if (wave) break;
+                    const float ratio = slopeRatio(o);
+                    if (wave) {
+                        // wave slope'ların üstünde/altında kayar; derine girerse ölür
+                        if (!ovr(s.x, s.y, half, o, 0.f)) break;
+                        const bool floorType = (o.sub == 1);
+                        const float xc = (floorType == (ratio > 0.f)) ? s.x + half : s.x - half;
+                        if (xc >= o.lx - 0.5f && xc <= o.rx + 0.5f) {
+                            const float ys = o.ly + (std::clamp(xc, o.lx, o.rx) - o.lx) * ratio;
+                            const float tol = snap + (1.f + std::fabs(ratio)) * std::fabs(dx) * (s.mini ? 2.f : 1.f) + 2.f;
+                            if (floorType) {
+                                const float pen = ys - (s.y - half);
+                                if (pen > 0.f) { if (pen <= tol) s.y = ys + half; else return false; }
+                            } else {
+                                const float pen = (s.y + half) - ys;
+                                if (pen > 0.f) { if (pen <= tol) s.y = ys - half; else return false; }
+                            }
+                        }
+                        break;
+                    }
                     const float gg = s.g;
                     const bool floorSide = (gg > 0.f) == (o.sub == 1);
-                    const float ratio = slopeRatio(o);
                     if (floorSide) {
                         float xc = ((gg > 0.f) == (ratio > 0.f)) ? s.x + half : s.x - half;
                         if (xc >= o.lx - 0.5f && xc <= o.rx + 0.5f) {
@@ -463,8 +494,46 @@ namespace {
         std::reverse(pl.pts.begin(), pl.pts.end());
     }
 
-    // Maliyet: tehdit yoksa hiçbir şey yapma (tıklama / yükseklik kaybı pahalı),
-    // gerekiyorsa en GEÇ ve en az tıklamayla çöz. hint: önceki plan (aynı kararlara hafif yapışır).
+    // Tüm plan boyunca tehlikeye en yakın ayrılık (birim). Ölürse -1e8. Uzun boşluk = daha güvenli plan.
+    constexpr float kDead = -1e8f;
+    float replayClearance(const S& root, const std::vector<uint8_t>& plan, size_t maxSteps,
+                          const World& W, const Cfg& C) {
+        S s = root; s.clr = kInf;
+        const size_t end = std::min(plan.size(), maxSteps);
+        for (size_t i = 0; i < end; ++i) {
+            s.prevHeld = s.held; s.held = plan[i] != 0;
+            if (!stepSim(s, W, C, 0.f)) return kDead;
+        }
+        return s.clr;
+    }
+
+    // Seçilen planı adım adım oynatıp pürüzsüz çizgi üretir (yakın kısım sık, uzak kısım seyrek örneklenir)
+    void pathFromPlan(const S& root, const std::vector<uint8_t>& plan, const World& W, const Cfg& C, PathLine& pl) {
+        S s = root;
+        pl.pts.clear();
+        pl.pts.push_back(ccp(s.x, s.y));
+        for (size_t i = 0; i < plan.size(); ++i) {
+            s.prevHeld = s.held; s.held = plan[i] != 0;
+            if (!stepSim(s, W, C, 0.f)) { pl.pts.push_back(ccp(s.x, s.y)); break; }
+            const size_t every = i < 600 ? 2 : 6;
+            if (i % every == 0) pl.pts.push_back(ccp(s.x, s.y));
+        }
+    }
+
+    // Çok çözünürlüklü adım: yakın = ince (hassas), uzak = kaba (ama çok uzağa bakar)
+    inline int stageD(int stepsDone, int dNear, int nearSteps) {
+        if (stepsDone < nearSteps) return dNear;
+        if (stepsDone < 480) return 5;
+        if (stepsDone < 1200) return 10;
+        return 20;
+    }
+
+    constexpr float kClrRange = 14.f;   // bu mesafeden yakın geçmek cezalı
+    constexpr float kClrW     = 25.f;
+
+    // Maliyet: tehdit yoksa hiçbir şey yapma (tıklama / yükseklik kaybı pahalı); tehlikeye yaklaşmak da pahalı,
+    // böylece bot "son milisaniyede" değil, tehlikeden geniş boşlukla geçecek zamanda tıklar.
+    // hint: önceki plan (aynı kararlara hafif yapışır).
     SearchOut runSearch(const S& root, const World& W, const Cfg& C, int Kbeam, int horizon, bool wantLines,
                         float marginBase, const std::vector<uint8_t>* hint, size_t hintPos) {
         SearchOut out;
@@ -475,9 +544,11 @@ namespace {
         auto& uniq = B.uniq;
         auto& keys = B.keys;
 
-        const int nearSteps = 144, Dnear = 3, Dfar = 5;
-        const int estStages = nearSteps / Dnear + std::max(0, horizon - nearSteps) / Dfar + 2;
-        const size_t want = static_cast<size_t>(estStages) * Kbeam * 2 + 8;
+        const int dNear = root.mode == M_WAVE ? 1 : ((root.mode == M_SHIP || root.mode == M_UFO || root.mode == M_SWING) ? 2 : 3);
+        const int nearSteps = root.mode == M_WAVE ? 96 : 144;
+        size_t estStages = 2;
+        for (int sd = 0; sd < horizon; sd += stageD(sd, dNear, nearSteps)) ++estStages;
+        const size_t want = estStages * static_cast<size_t>(Kbeam) * 2 + 8;
         nodes.clear();
         if (nodes.capacity() < want) nodes.reserve(want);
         Node r; r.s = root; r.act = root.held ? 1 : 0; r.x = root.x; r.y = root.y;
@@ -487,8 +558,7 @@ namespace {
         int stepsDone = 0, bestDead = -1;
 
         while (stepsDone < horizon) {
-            const int D = stepsDone < nearSteps ? Dnear : Dfar;
-            const float early = 30.f * static_cast<float>(horizon - stepsDone) / static_cast<float>(horizon);
+            const int D = std::min(stageD(stepsDone, dNear, nearSteps), horizon - stepsDone);
             const bool hintOk = hint && hintPos + static_cast<size_t>(stepsDone) < hint->size();
             const int hintAct = hintOk ? ((*hint)[hintPos + static_cast<size_t>(stepsDone)] != 0 ? 1 : 0) : -1;
             cand.clear();
@@ -498,6 +568,7 @@ namespace {
                     const int prevAct = nd.act;
                     const int act = (a == 0) ? prevAct : 1 - prevAct;
                     nd.parent = bi; nd.act = static_cast<uint8_t>(act); nd.d = static_cast<uint8_t>(D); nd.dead = false;
+                    nd.s.clr = kInf;
                     int k = 0;
                     for (; k < D; ++k) {
                         nd.s.prevHeld = nd.s.held; nd.s.held = act != 0;
@@ -508,7 +579,7 @@ namespace {
 
                     float inc = 0.f;
                     if (groundMode(nd.s.mode)) {
-                        if (act && !prevAct) inc += 100.f + early;      // tıklama pahalı, erken tıklama daha pahalı
+                        if (act && !prevAct) inc += 100.f;              // tıklama pahalı
                         if (act) inc += 2.f;                            // basılı tutma
                         if (!nd.s.grounded) inc += 0.2f * D;            // havada kalma
                         // açık havada (tavansız) çok yükseğe uçmak gerçek oyunda ölümdür: ucuza kaçış yolu sayma
@@ -516,6 +587,11 @@ namespace {
                     } else {
                         inc += std::fabs(nd.s.y - root.y) * 0.08f;      // yüksekliği koru (gereksiz inme/çıkma yok)
                         if (act != prevAct) inc += 1.f;                 // giriş değiştirme
+                    }
+                    // tehlikeye yakın geçmek pahalı (D'ye göre normalize: ince adımlar haksız cezalanmasın)
+                    if (nd.s.clr < kClrRange) {
+                        const float t = (kClrRange - std::max(nd.s.clr, 0.f)) / kClrRange;     // 0..1
+                        inc += kClrW * t * t * (static_cast<float>(D) / 3.f);                  // karesel: iki uçta dengeli boşluk ister
                     }
                     if (hintAct >= 0 && act != hintAct) inc += 3.f;     // önceki plandan sapma: küçük ceza (titreşim azaltır)
                     nd.cost += inc;
@@ -559,29 +635,29 @@ namespace {
         int chosen = -1;
         if (stepsDone >= horizon && !beam.empty()) {
             out.survived = true;
-            // Plan sonunda yerde olmak güvenlidir (iyi botların kullandığı puan)
             auto& order = B.order;
             order.clear();
             for (int idx : beam) {
+                // plan sonunda yerde olmak güvenlidir (iyi botların kullandığı puan)
                 float c = nodes[idx].cost + ((groundMode(nodes[idx].s.mode) && !nodes[idx].s.grounded) ? 15.f : 0.f);
                 order.push_back({c, idx});
             }
             std::sort(order.begin(), order.end());
-            // En güvenli planı seç: tehlike hitbox'ını şişirerek test et (model hatası tamponu)
-            const float margins[4] = {marginBase, marginBase * 0.6f, marginBase * 0.35f, marginBase * 0.12f};
-            bool found = false;
-            for (float m : margins) {
-                int tried = 0;
-                for (auto& pr : order) {
-                    if (++tried > 16) break;
-                    auto plan = extractPlan(nodes, pr.second);
-                    if (replayAlive(root, plan, 0, plan.size(), W, C, m)) {
-                        chosen = pr.second; out.plan = std::move(plan); found = true; break;
-                    }
+            // Adaylar arasında tehlikeden en geniş boşlukla geçeni seç (model hatası tamponu).
+            // Eşitlikte (±0.25) en düşük maliyetli kalır.
+            float bestScore = -1e9f;
+            int tried = 0;
+            for (auto& pr : order) {
+                if (++tried > 16) break;
+                auto plan = extractPlan(nodes, pr.second);
+                const float clr = replayClearance(root, plan, 480, W, C);
+                if (clr <= kDead * 0.5f) continue;
+                const float score = std::min(clr, marginBase);
+                if (score > bestScore + 0.25f) {
+                    bestScore = score; chosen = pr.second; out.plan = std::move(plan);
                 }
-                if (found) break;
             }
-            if (!found) { chosen = order[0].second; out.plan = extractPlan(nodes, chosen); }
+            if (chosen < 0) { chosen = order[0].second; out.plan = extractPlan(nodes, chosen); }
         } else if (bestDead >= 0) {
             chosen = bestDead;
             out.plan = extractPlan(nodes, chosen);
@@ -599,7 +675,9 @@ namespace {
                 PathLine pl; pl.kind = 1; chainPoints(nodes, i, pl);
                 out.lines.push_back(std::move(pl)); ++deadShown;
             }
-            if (chosen >= 0) { PathLine pl; pl.kind = 2; chainPoints(nodes, chosen, pl); out.lines.push_back(std::move(pl)); }
+            if (chosen >= 0 && !out.plan.empty()) {
+                PathLine pl; pl.kind = 2; pathFromPlan(root, out.plan, W, C, pl); out.lines.push_back(std::move(pl));
+            }
         }
         return out;
     }
@@ -752,7 +830,7 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
             if (o.x1 < minX) continue;
             if (o.kind == Kind::Pad || o.kind == Kind::Ring || o.kind == Kind::Portal) o.orb = orb < kMaxOrb ? static_cast<int16_t>(orb++) : -1;
             f->local.push_back(o);
-            if (f->local.size() >= 2500) break;
+            if (f->local.size() >= 12000) break;
         }
         f->localPm.resize(f->local.size());
         float m = -1e9f;
@@ -921,7 +999,7 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
 
         // ---------- durum + yerel dünya ----------
         const float look = static_cast<float>(Mod::get()->getSettingValue<double>("look-ahead"));
-        const int horizonSteps = std::clamp(static_cast<int>(look * 240.f), 120, 960);
+        const int horizonSteps = std::clamp(static_cast<int>(look * 240.f), 120, 2400);
         const float reach = f->vx * look * 1.3f + 80.f;
         if (f->gatherReach <= 0.f || px < f->gatherX || px > f->gatherX + 150.f || reach > f->gatherReach - 150.f)
             gather(px, reach + 200.f);
