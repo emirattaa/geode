@@ -1,17 +1,16 @@
-// Geode Autoplay v1.1 - clearance odaklı, güvenli geçiş, level bitirme
+// Geode Autoplay v1.2 - ULTRA SAFE (Kıl Payı Geçiş Engellendi)
 //
-// v1.0 -> v1.1 (ekran görüntüsü geri bildirimi):
-//  * CLEARANCE GÜÇLENDİRİLDİ: kClrRange=45 (hitbox 3x), kClrW=400 (tıklamanın 4x),
-//    ceza eğrisi t^3 (keskin). Bot artık "kıl payı" yerine geniş boşluk arar.
-//  * stepSim'de s.clr = sep - haz. Yani clearance güvenlik payını da içeriyor,
-//    güvenli sınır 0 kabul edilir.
-//  * simMargin güçlendirildi: eff*0.6, min 3.5, max 8 (önceden max 4.2).
-//  * Ölümcül sınırlarda sim margin tam uygulanıyor (0.5 çarpanı kaldırıldı).
-//  * Beam'de tehlikeye yakın geçen düğümler çok daha pahalı.
-//  * Aday seçimi: marginBase'e ulaşan plan bulunca erken çık, bulamazsa en iyi clearance.
-//  * pathFromPlan simMargin kullanıyor (görsel plan = uygulanan plan).
-//
-// Fizik: GD 2.2081 decompile topluluğu.
+// v1.1 -> v1.2 (Görsel geri bildirim üzerine):
+//  * TEHLİKE HİTBOXLARI BÜYÜTÜLDÜ: Spike ve tehlike objelerinin hitbox'ları simülasyonda
+//    her yönden +6 birim büyütülüyor. Botun kıl payı geçmesi imkansız hale getirildi.
+//  * Bilinen spike ID'leri (8, 9, 39 vb.) kod üzerinden zorla "Hazard" (Tehlike) yapıldı.
+//    Böylece bot onları "blok" sanıp üstüne basmaz.
+//  * simMargin (Simülasyon Güvenlik Payı) minimum 12 birime çıkarıldı.
+//  * kClrRange 60, kClrW 1000 yapıldı. Tehlikeye 60 birimden fazla yaklaşan yollar
+//    aşırı yüksek ceza alıyor.
+//  * Plan seçiminde "güvenli mesafe" şartı eklendi. simMargin kadar uzak olan
+//    bir plan bulunursa anında kabul edilir.
+//  * Ölümcül çarpışmalarda (Solid/Hazard) tolerans sıfırlandı.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
@@ -276,8 +275,8 @@ namespace {
             if (o.x1 < s.x - half - 30.f) continue;
             switch (o.kind) {
                 case Kind::Hazard: {
+                    // HAZARD: Güvenlik payı (haz) ile çarpışma kontrolü
                     if (ovr(s.x, s.y, half, o, haz)) return false;
-                    // DÜZELTME: clearance güvenlik payını da içerir (negatifse güvenlik sınırına girmiş)
                     const float sx = std::max(o.x0 - (s.x + half), (s.x - half) - o.x1);
                     const float sy = std::max(o.y0 - (s.y + half), (s.y - half) - o.y1);
                     const float sep = std::max(sx, sy) - haz;
@@ -491,9 +490,9 @@ namespace {
         return 20;
     }
 
-    // DÜZELTME: çok daha geniş ve ağır clearance
-    constexpr float kClrRange = 45.f;
-    constexpr float kClrW     = 400.f;
+    // DÜZELTME: Devasa clearance cezası
+    constexpr float kClrRange = 60.f;
+    constexpr float kClrW     = 1000.f;
 
     SearchOut runSearch(const S& root, const World& W, const Cfg& C, int Kbeam, int horizon, bool wantLines,
                         float marginBase, float simMargin,
@@ -549,7 +548,6 @@ namespace {
                         inc += std::fabs(nd.s.y - root.y) * 0.08f;
                         if (act != prevAct) inc += 1.f;
                     }
-                    // DÜZELTME: çok daha ağır clearance cezası (t^3)
                     if (nd.s.clr < kClrRange) {
                         const float t = (kClrRange - std::max(nd.s.clr, 0.f)) / kClrRange;
                         inc += kClrW * t * t * t * (static_cast<float>(D) / 3.f);
@@ -604,7 +602,7 @@ namespace {
             }
             std::sort(order.begin(), order.end());
 
-            // Geniş aday tarama, iyi plan bulunca erken çık
+            // ULTRA SAFE PLAN SEÇİMİ: simMargin kadar net boşluk yoksa kabul etme
             float bestScore = -1e9f;
             int tried = 0;
             const int maxTries = std::min(50, static_cast<int>(order.size()));
@@ -613,11 +611,21 @@ namespace {
                 auto plan = extractPlan(nodes, pr.second);
                 const float clr = replayClearance(root, plan, 480, W, C, simMargin);
                 if (clr <= kDead * 0.5f) continue;
-                const float score = std::min(clr, marginBase);
-                if (score > bestScore + 0.25f) {
-                    bestScore = score; chosen = pr.second; out.plan = std::move(plan);
+                
+                // Eğer simMargin'den daha fazla boşluk varsa direkt kabul et (en güvenli)
+                if (clr >= simMargin) {
+                    bestScore = clr;
+                    chosen = pr.second;
+                    out.plan = std::move(plan);
+                    break; 
                 }
-                if (bestScore >= marginBase - 0.25f) break;
+                
+                // Yoksa en yüksek clearance'a sahip olanı seç
+                if (clr > bestScore + 0.5f) {
+                    bestScore = clr; 
+                    chosen = pr.second; 
+                    out.plan = std::move(plan);
+                }
             }
             if (chosen < 0) {
                 chosen = order[0].second;
@@ -685,6 +693,13 @@ namespace {
             case 1334: o.kind = Kind::Portal; o.sub = PT_SPEED; o.val = 576.f;   return true;
             default: break;
         }
+
+        // ZORLA HAZARD: Bazı spike'lar Solid dönüyor, bot üstüne basıp ölüyor.
+        if (id == 8 || id == 9 || id == 39 || id == 103 || id == 104 || id == 105 || id == 392 || id == 394) {
+            o.kind = Kind::Hazard;
+            return true;
+        }
+
         switch (type) {
             case GameObjectType::Hazard:         o.kind = Kind::Hazard; return true;
             case GameObjectType::Solid:          o.kind = Kind::Solid;  return true;
@@ -805,6 +820,13 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
                 if (u) f->unsup.push_back({(o.x0 + o.x1) * 0.5f, (o.y0 + o.y1) * 0.5f, oid});
             }
             if (!classify(go->m_objectID, go->m_objectType, o)) continue;
+            
+            // TEHLİKELERE SANAL ZIRH: Hitbox'ları büyüt ki kıl payı geçiş imkansız olsun
+            if (o.kind == Kind::Hazard) {
+                o.x0 -= 6.f; o.x1 += 6.f;
+                o.y0 -= 6.f; o.y1 += 6.f;
+            }
+
             if (o.kind == Kind::Slope) slopeLine(go, o);
             f->objs.push_back(o);
         }
@@ -1138,12 +1160,12 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
             ur.erase(std::remove_if(ur.begin(), ur.end(), [&](const std::pair<float, float>& p) { return p.first < px - 300.f; }), ur.end());
         }
 
-        // DÜZELTME: simMargin çok daha güçlü
+        // ULTRA SAFE: Minimum 12 birim güvenlik payı
         const float baseMargin = std::clamp(static_cast<float>(Mod::get()->getSettingValue<double>("safety-margin")), 0.f, 14.f);
         float effMargin = baseMargin;
-        if (f->escalation >= 2) effMargin *= 0.7f;
-        if (f->escalation >= 3) effMargin *= 0.5f;
-        const float simMargin = std::max(3.5f, std::min(8.f, effMargin * 0.6f));
+        if (f->escalation >= 2) effMargin *= 0.8f;
+        if (f->escalation >= 3) effMargin *= 0.6f;
+        const float simMargin = std::max(12.f, std::min(16.f, effMargin * 1.2f));
 
         bool need = f->plan.empty() || f->planPos + 24 > f->plan.size() || !f->lastSurvived;
         if (!need) need = !replayAlive(root, f->plan, f->planPos, 120, W, C, simMargin);
