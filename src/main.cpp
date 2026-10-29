@@ -1,16 +1,39 @@
-// Geode Autoplay v1.2 - ULTRA SAFE (Kıl Payı Geçiş Engellendi)
+// Geode Autoplay v0.9 - tüm modlar, orb/pad/portal/slope, beam search planlama
 //
-// v1.1 -> v1.2 (Görsel geri bildirim üzerine):
-//  * TEHLİKE HİTBOXLARI BÜYÜTÜLDÜ: Spike ve tehlike objelerinin hitbox'ları simülasyonda
-//    her yönden +6 birim büyütülüyor. Botun kıl payı geçmesi imkansız hale getirildi.
-//  * Bilinen spike ID'leri (8, 9, 39 vb.) kod üzerinden zorla "Hazard" (Tehlike) yapıldı.
-//    Böylece bot onları "blok" sanıp üstüne basmaz.
-//  * simMargin (Simülasyon Güvenlik Payı) minimum 12 birime çıkarıldı.
-//  * kClrRange 60, kClrW 1000 yapıldı. Tehlikeye 60 birimden fazla yaklaşan yollar
-//    aşırı yüksek ceza alıyor.
-//  * Plan seçiminde "güvenli mesafe" şartı eklendi. simMargin kadar uzak olan
-//    bir plan bulunursa anında kabul edilir.
-//  * Ölümcül çarpışmalarda (Solid/Hazard) tolerans sıfırlandı.
+// v0.8 -> v0.9: TEŞHİS. Ölünce ekranda "ölüm raporu" çıkar (neden öldü: planlayıcı çözüm bulamadı mı, model gerçekten
+//   saptı mı, desteklenmeyen obje mi var). Level'deki desteklenmeyen objeler (dash orb, dual, teleport, ayna, trigger)
+//   sayılır. "Otomatik kalibrasyon" ayarı eklendi (kapatınca sabit fizik sabitleri kullanılır).
+//
+// v0.7 -> v0.8 değişiklikleri:
+//  * SON ANDA ATLAMA düzeltildi: arama artık tehlikeye olan mesafeyi (clearance) ölçüyor, tehlikeye yaklaşmayı cezalandırıyor
+//    ve eski "geç tıkla" önyargısı kaldırıldı. Son plan, en geniş boşluğu bırakan adaydan seçiliyor.
+//  * UZAK SİMÜLASYON: bakış süresi 10 saniyeye (2400 adım) çıktı. Uzak kısım çok çözünürlüklü aranır (3/5/10/20 adım).
+//    Seçilen yol artık adım adım yeniden oynatılıp pürüzsüz ve uzun çizilir.
+//  * WAVE: slope'lar artık simülasyonda var (wave üstünden kayar, eskiden içinden geçiyordu); yan çarpma toleransı
+//    daraltıldı; wave/ship için daha ince giriş adımı (1/2 adım) kullanılır.
+//
+// v0.6 -> v0.7 değişiklikleri:
+//  * [ANA BUG] Her yeniden planlamada kök durumun "kullanılmış" bitleri sıfırdı. Oyuncunun içinde durduğu
+//    pad / portal simülasyonda TEKRAR tetikleniyordu (gravity-toggle portalı iki kez çeviriyor, pad tekrar
+//    fırlatıyor, plan çöpe dönüyordu). Artık üstündeki pad/portal ve botun tıkladığı ring'ler kullanılmış sayılır.
+//  * Dikey konum ölçeği (kPos) oyundan canlı kalibre edilir. Eski sabit 0.225 yanlışsa zıplama yüksekliği/süresi
+//    kayıyordu; yerçekimi kalibrasyonu da aynı ölçeğe bağlandı.
+//  * Zemin (groundB) kalibrasyonu artık bir platformun üstünde yanlışlıkla bozulmuyor; ve alan hesabından ÖNCE yapılıyor.
+//  * Hız (vx) hız portallarından sonra anında doğru okunuyor (eskiden EMA gecikmesi vardı).
+//  * Robot zıplama sayacı gerçek oyundan takip ediliyor.
+//  * Beam search: tamponlar yeniden kullanılıyor (kare takılması azalır), daha iyi hash, önceki plana yapışma
+//    (titreşen giriş azalır), "güvenlik payı" ayarı, bot kapalıyken sadece çizim için seyrek arama.
+//  * Yerel dünya her adımda değil, gerektiğinde toplanıyor (CPU); limit 900 -> 12000 obje.
+//  * used bit sayısı 128 -> 512.
+//
+// Fizik kaynakları (GD 2.2081 decompile'larından türetilmiş, topluluk projeleri):
+//  - 240 Hz adım, hız birimi: 1 birim = kPos koordinat/adım (varsayılan 0.225, canlı ölçülür)
+//  - küp zıplama 11.18, yerçekimi 0.958199/adım, terminal hız 15
+//  - ball/spider yerçekimi x0.6, robot x0.9, swing x0.4, mini zıplama x0.8
+//  - ship limit +8/-6.4, ufo zıplama 7, wave 45 derece (mini 2:1)
+//  - hitbox: oyuncu 30 (mini 18), wave 10, spider 27; iç hitbox 0.3x;
+//    diken dış hitbox ile öldürür; blok iniş toleransı 10 (uçan modlar 6)
+// Değerler oyundan CANLI ölçülerek kalibre edilir (yerçekimi, zıplama, ship ivmesi, hız, konum ölçeği).
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
@@ -28,11 +51,11 @@
 using namespace geode::prelude;
 
 namespace {
-    constexpr float K       = 0.225f;
+    constexpr float K       = 0.225f;       // hız birimi -> koordinat / adım (varsayılan; Cfg::kPos canlı ölçülür)
     constexpr float G0      = 0.958199f;
     constexpr float kStepDt = 1.f / 240.f;
     constexpr float kInf    = 1e9f;
-    constexpr int   kMaxOrb = 512;
+    constexpr int   kMaxOrb = 512;          // plan penceresindeki pad/ring/portal sayısı sınırı
 
     enum Mode : int { M_CUBE = 0, M_SHIP, M_BALL, M_UFO, M_WAVE, M_ROBOT, M_SPIDER, M_SWING, M_COUNT };
     enum class Kind : uint8_t { Hazard, Solid, Slope, Pad, Ring, Portal };
@@ -42,38 +65,38 @@ namespace {
     struct Obj {
         float x0 = 0, x1 = 0, y0 = 0, y1 = 0;
         Kind kind = Kind::Solid;
-        uint8_t sub = 0;
-        uint8_t mode = 0;
-        int16_t orb = -1;
-        float lx = 0, ly = 0, rx = 1, ry = 0;
-        float val = 0;
+        uint8_t sub = 0;      // pad/ring: Eff, portal: PortalT, slope: 1 = katı altta
+        uint8_t mode = 0;     // mod portalı hedefi
+        int16_t orb = -1;     // "bir kez tetiklendi" bit indeksi
+        float lx = 0, ly = 0, rx = 1, ry = 0; // slope yüzey çizgisi (soldan sağa)
+        float val = 0;        // hız portalı
     };
 
     struct Cfg {
         float gMult[M_COUNT] = {1.f, 0.4f, 0.6f, 0.5f, 0.f, 0.9f, 0.6f, 0.4f};
         float jumpV  = 11.18f;
         float ufoV   = 7.f;
+        // [0] basılı&u>=0, [1] basılı&u<0, [2] bırakık&u>0, [3] bırakık&u<=0
         float shipAcc[4] = {0.4f * G0 * K, 0.5f * G0 * K, 1.2f * 0.4f * G0 * K, 0.8f * 0.4f * G0 * K};
         float shipUp = 8.f, shipDown = 6.4f;
         float groundB = 90.f;
-        float kPos = K;
+        float kPos = K;       // koordinat / (hız birimi * adım)
     };
 
     struct S {
         float x = 0, y = 0, vy = 0, vx = 311.58f;
-        float g = 1.f;
-        float B = 90.f, T = kInf;
-        float gb = 90.f;
+        float g = 1.f;               // +1 normal, -1 ters yerçekimi
+        float B = 90.f, T = kInf;    // mod alanı alt/üst sınırı
+        float gb = 90.f;             // zemin
         float slope = 0.f;
         int8_t mode = 0;
         int16_t robotBoost = 0;
         bool mini = false, grounded = true, held = false, prevHeld = false, onSlope = false;
-        float clr = kInf;
+        float clr = kInf;            // tehlikeye en yakın ayrılık (birim); sadece planlama için
         uint64_t used[kMaxOrb / 64] = {};
     };
 
     inline bool flyingMode(int m) { return m == M_SHIP || m == M_UFO || m == M_WAVE || m == M_SWING; }
-    inline bool groundMode(int m) { return m == M_CUBE || m == M_ROBOT || m == M_BALL || m == M_SPIDER; }
     inline float modeHeight(int m) {
         if (m == M_SHIP || m == M_UFO || m == M_WAVE || m == M_SWING) return 300.f;
         if (m == M_BALL || m == M_SPIDER) return 240.f;
@@ -97,6 +120,7 @@ namespace {
         return std::fabs(w) < 1e-3f ? 0.f : (o.ry - o.ly) / w;
     }
 
+    // x'e göre sıralı obje listesi + x1 için kümülatif maksimum (ikili arama ile hızlı aralık)
     struct World { const Obj* L; const float* pm; int n; };
     inline int firstIdx(const World& W, float minX) {
         return static_cast<int>(std::lower_bound(W.pm, W.pm + W.n, minX) - W.pm);
@@ -105,15 +129,16 @@ namespace {
     void areaFromCenter(S& s, int mode, float pc) {
         float H = modeHeight(mode);
         if (H >= kInf) { s.B = s.gb; s.T = kInf; return; }
-        s.B = std::max(s.gb, pc - H * 0.5f);
+        s.B = std::max(s.gb, s.gb + 30.f * std::floor((pc - s.gb - H * 0.5f) / 30.f + 0.5f));
         s.T = s.B + H;
         if (s.y - 15.f < s.B) s.B = s.y - 15.f;
         if (s.y + 15.f > s.T) s.T = s.y + 15.f;
     }
 
+    // Orb / pad etkisi (hız birimi: oyunun native birimi)
     void orbFx(S& s, uint8_t eff, float jv, bool pad) {
         const float base = pad ? 16.f : jv;
-        if (s.mode == M_WAVE) {
+        if (s.mode == M_WAVE) {                       // wave: sadece yerçekimi değişir
             if (eff == E_BLUE || eff == E_GREEN) s.g = -s.g;
             return;
         }
@@ -155,6 +180,7 @@ namespace {
         return false;
     }
 
+    // Spider: anında en yakın yüzeye ışınlanır, yerçekimi döner. false = yolda diken, ölüm.
     bool spiderTeleport(S& s, const World& W, float half) {
         const float dir = -s.g;
         const float start = s.y + dir * half;
@@ -166,7 +192,7 @@ namespace {
             if (dir > 0.f) { if (o.y0 >= start - 1.f && o.y0 < best) best = o.y0; }
             else           { if (o.y1 <= start + 1.f && o.y1 > best) best = o.y1; }
         }
-        if (std::fabs(best) > kInf * 0.5f) return false;
+        if (std::fabs(best) > kInf * 0.5f) return true;
         for (int i = firstIdx(W, s.x - half); i < W.n && W.L[i].x0 <= s.x + half; ++i) {
             const Obj& o = W.L[i];
             if (o.kind != Kind::Hazard) continue;
@@ -178,6 +204,7 @@ namespace {
         return true;
     }
 
+    // Tek fizik adımı. false = öldü. haz: tehlike hitbox'ına eklenen güvenlik payı.
     bool stepSim(S& s, const World& W, const Cfg& C, float haz) {
         const bool wave = s.mode == M_WAVE;
         const bool fly = flyingMode(s.mode);
@@ -199,6 +226,7 @@ namespace {
             }
         }
 
+        // --- orb ---
         bool consumed = false;
         if (press) {
             for (int i = firstIdx(W, s.x - half - 10.f); i < W.n && W.L[i].x0 <= s.x + half + 10.f; ++i) {
@@ -213,6 +241,7 @@ namespace {
 
         float g = s.g, u = s.vy * g;
 
+        // --- moda göre giriş ---
         if (!consumed && !wave) {
             switch (s.mode) {
                 case M_CUBE:   if (s.grounded && s.held) { u = jv; s.grounded = false; s.onSlope = false; } break;
@@ -231,6 +260,7 @@ namespace {
             }
         }
 
+        // --- hız güncelle + konum ---
         if (wave) {
             float dir = (s.held ? 1.f : -1.f) * g;
             s.y += dir * dx * (s.mini ? 2.f : 1.f);
@@ -257,9 +287,10 @@ namespace {
         }
         s.x += dx;
 
+        // --- mod alanı sınırları ---
         const float lo = s.B + half, hi = s.T - half;
         if (s.y <= lo) {
-            if (cubeLike && s.g < 0.f) return false;
+            if (cubeLike && s.g < 0.f) return false;     // ters küp zemine çarparsa ölür
             s.y = lo;
             if (!wave && s.vy < 0.f) s.vy = 0.f;
             if (s.g > 0.f && !fly && !wave) { s.grounded = true; s.onSlope = false; }
@@ -270,26 +301,27 @@ namespace {
             if (s.g < 0.f && !fly && !wave) { s.grounded = true; s.onSlope = false; }
         }
 
+        // --- objeler ---
         for (int i = firstIdx(W, s.x - half - 30.f); i < W.n && W.L[i].x0 <= s.x + half + 30.f; ++i) {
             const Obj& o = W.L[i];
             if (o.x1 < s.x - half - 30.f) continue;
             switch (o.kind) {
                 case Kind::Hazard: {
-                    // HAZARD: Güvenlik payı (haz) ile çarpışma kontrolü
                     if (ovr(s.x, s.y, half, o, haz)) return false;
                     const float sx = std::max(o.x0 - (s.x + half), (s.x - half) - o.x1);
                     const float sy = std::max(o.y0 - (s.y + half), (s.y - half) - o.y1);
-                    const float sep = std::max(sx, sy) - haz;
+                    const float sep = std::max(sx, sy);
                     if (sep < s.clr) s.clr = sep;
                     break;
                 }
+
                 case Kind::Solid:
                     if (ovr(s.x, s.y, half, o, 0.f)) {
                         if (wave) {
                             float prevFeet = prevY - half, prevHead = prevY + half;
                             if (s.y < prevY && prevFeet >= o.y1 - snap)      s.y = o.y1 + half;
                             else if (s.y > prevY && prevHead <= o.y0 + snap) s.y = o.y0 - half;
-                            else if (ovr(s.x, s.y, half * 0.8f, o, haz)) return false;
+                            else if (ovr(s.x, s.y, half * 0.8f, o, haz * 0.5f)) return false;   // wave: yan çarpma toleransı dar
                         } else {
                             const float gg = s.g;
                             const float uu = s.vy * gg;
@@ -303,15 +335,17 @@ namespace {
                                 s.grounded = !fly; s.onSlope = false;
                             } else if (uu > 0.f && below) {
                                 s.y = faceH - gg * half; s.vy = 0.f;
-                            } else if (ovr(s.x, s.y, inner, o, haz)) {
+                            } else if (ovr(s.x, s.y, inner, o, haz * 0.5f)) {
                                 return false;
                             }
                         }
                     }
                     break;
+
                 case Kind::Slope: {
                     const float ratio = slopeRatio(o);
                     if (wave) {
+                        // wave slope'ların üstünde/altında kayar; derine girerse ölür
                         if (!ovr(s.x, s.y, half, o, 0.f)) break;
                         const bool floorType = (o.sub == 1);
                         const float xc = (floorType == (ratio > 0.f)) ? s.x + half : s.x - half;
@@ -355,12 +389,16 @@ namespace {
                     }
                     break;
                 }
+
                 case Kind::Pad:
                     if (!isUsed(s, o.orb) && ovr(s.x, s.y, half, o, 0.f)) {
                         setUsed(s, o.orb); orbFx(s, o.sub, jv, true);
                     }
                     break;
-                case Kind::Ring: break;
+
+                case Kind::Ring:
+                    break;
+
                 case Kind::Portal:
                     if (!isUsed(s, o.orb) && ovr(s.x, s.y, half, o, 0.f)) {
                         setUsed(s, o.orb);
@@ -385,15 +423,16 @@ namespace {
         return true;
     }
 
+    // ---------------- Beam search ----------------
     struct PathLine { std::vector<CCPoint> pts; int kind = 0; };
 
     struct Node {
         S s;
         int parent = -1;
-        int steps = 0;
+        int steps = 0;       // ölüm anına kadar yaşanan toplam adım
         float cost = 0.f;
         uint8_t act = 0;
-        uint8_t d = 0;
+        uint8_t d = 0;       // bu düğümün kapsadığı adım sayısı
         bool dead = false;
         float x = 0, y = 0;
     };
@@ -406,12 +445,15 @@ namespace {
 
     struct BeamKey { uint64_t k; float cost; int idx; };
 
+    // Arama tamponları: her aramada yeniden ayırmak yerine tekrar kullanılır
     struct SearchBuf {
         std::vector<Node> nodes;
         std::vector<int> beam, cand, uniq;
         std::vector<BeamKey> keys;
         std::vector<std::pair<float, int>> order;
     };
+
+    inline bool groundMode(int m) { return m == M_CUBE || m == M_ROBOT || m == M_BALL || m == M_SPIDER; }
 
     inline uint64_t mix64(uint64_t x) {
         x ^= x >> 33; x *= 0xff51afd7ed558ccdull;
@@ -458,31 +500,33 @@ namespace {
         std::reverse(pl.pts.begin(), pl.pts.end());
     }
 
+    // Tüm plan boyunca tehlikeye en yakın ayrılık (birim). Ölürse -1e8. Uzun boşluk = daha güvenli plan.
     constexpr float kDead = -1e8f;
-
     float replayClearance(const S& root, const std::vector<uint8_t>& plan, size_t maxSteps,
-                          const World& W, const Cfg& C, float margin) {
+                          const World& W, const Cfg& C) {
         S s = root; s.clr = kInf;
         const size_t end = std::min(plan.size(), maxSteps);
         for (size_t i = 0; i < end; ++i) {
             s.prevHeld = s.held; s.held = plan[i] != 0;
-            if (!stepSim(s, W, C, margin)) return kDead;
+            if (!stepSim(s, W, C, 0.f)) return kDead;
         }
         return s.clr;
     }
 
-    void pathFromPlan(const S& root, const std::vector<uint8_t>& plan, const World& W, const Cfg& C, float margin, PathLine& pl) {
+    // Seçilen planı adım adım oynatıp pürüzsüz çizgi üretir (yakın kısım sık, uzak kısım seyrek örneklenir)
+    void pathFromPlan(const S& root, const std::vector<uint8_t>& plan, const World& W, const Cfg& C, PathLine& pl) {
         S s = root;
         pl.pts.clear();
         pl.pts.push_back(ccp(s.x, s.y));
         for (size_t i = 0; i < plan.size(); ++i) {
             s.prevHeld = s.held; s.held = plan[i] != 0;
-            if (!stepSim(s, W, C, margin)) { pl.pts.push_back(ccp(s.x, s.y)); break; }
+            if (!stepSim(s, W, C, 0.f)) { pl.pts.push_back(ccp(s.x, s.y)); break; }
             const size_t every = i < 600 ? 2 : 6;
             if (i % every == 0) pl.pts.push_back(ccp(s.x, s.y));
         }
     }
 
+    // Çok çözünürlüklü adım: yakın = ince (hassas), uzak = kaba (ama çok uzağa bakar)
     inline int stageD(int stepsDone, int dNear, int nearSteps) {
         if (stepsDone < nearSteps) return dNear;
         if (stepsDone < 480) return 5;
@@ -490,13 +534,14 @@ namespace {
         return 20;
     }
 
-    // DÜZELTME: Devasa clearance cezası
-    constexpr float kClrRange = 60.f;
-    constexpr float kClrW     = 1000.f;
+    constexpr float kClrRange = 14.f;   // bu mesafeden yakın geçmek cezalı
+    constexpr float kClrW     = 25.f;
 
+    // Maliyet: tehdit yoksa hiçbir şey yapma (tıklama / yükseklik kaybı pahalı); tehlikeye yaklaşmak da pahalı,
+    // böylece bot "son milisaniyede" değil, tehlikeden geniş boşlukla geçecek zamanda tıklar.
+    // hint: önceki plan (aynı kararlara hafif yapışır).
     SearchOut runSearch(const S& root, const World& W, const Cfg& C, int Kbeam, int horizon, bool wantLines,
-                        float marginBase, float simMargin,
-                        const std::vector<uint8_t>* hint, size_t hintPos) {
+                        float marginBase, const std::vector<uint8_t>* hint, size_t hintPos) {
         SearchOut out;
         static thread_local SearchBuf B;
         auto& nodes = B.nodes;
@@ -533,26 +578,28 @@ namespace {
                     int k = 0;
                     for (; k < D; ++k) {
                         nd.s.prevHeld = nd.s.held; nd.s.held = act != 0;
-                        if (!stepSim(nd.s, W, C, simMargin)) { nd.dead = true; break; }
+                        if (!stepSim(nd.s, W, C, 0.f)) { nd.dead = true; break; }
                     }
                     nd.steps += k;
                     nd.x = nd.s.x; nd.y = nd.s.y;
 
                     float inc = 0.f;
                     if (groundMode(nd.s.mode)) {
-                        if (act && !prevAct) inc += 100.f;
-                        if (act) inc += 2.f;
-                        if (!nd.s.grounded) inc += 0.2f * D;
+                        if (act && !prevAct) inc += 100.f;              // tıklama pahalı
+                        if (act) inc += 2.f;                            // basılı tutma
+                        if (!nd.s.grounded) inc += 0.2f * D;            // havada kalma
+                        // açık havada (tavansız) çok yükseğe uçmak gerçek oyunda ölümdür: ucuza kaçış yolu sayma
                         if (nd.s.T >= kInf * 0.5f && nd.s.y > nd.s.gb + 450.f) inc += 20.f;
                     } else {
-                        inc += std::fabs(nd.s.y - root.y) * 0.08f;
-                        if (act != prevAct) inc += 1.f;
+                        inc += std::fabs(nd.s.y - root.y) * 0.08f;      // yüksekliği koru (gereksiz inme/çıkma yok)
+                        if (act != prevAct) inc += 1.f;                 // giriş değiştirme
                     }
+                    // tehlikeye yakın geçmek pahalı (D'ye göre normalize: ince adımlar haksız cezalanmasın)
                     if (nd.s.clr < kClrRange) {
-                        const float t = (kClrRange - std::max(nd.s.clr, 0.f)) / kClrRange;
-                        inc += kClrW * t * t * t * (static_cast<float>(D) / 3.f);
+                        const float t = (kClrRange - std::max(nd.s.clr, 0.f)) / kClrRange;     // 0..1
+                        inc += kClrW * t * t * (static_cast<float>(D) / 3.f);                  // karesel: iki uçta dengeli boşluk ister
                     }
-                    if (hintAct >= 0 && act != hintAct) inc += 3.f;
+                    if (hintAct >= 0 && act != hintAct) inc += 3.f;     // önceki plandan sapma: küçük ceza (titreşim azaltır)
                     nd.cost += inc;
 
                     nodes.push_back(nd);
@@ -585,7 +632,7 @@ namespace {
                 const int need = Kbeam - keep;
                 const size_t rest = uniq.size() - keep;
                 beam.assign(uniq.begin(), uniq.begin() + keep);
-                for (int i = 0; i < need; ++i) beam.push_back(uniq[keep + static_cast<size_t>(i) * rest / need]);
+                for (int i = 0; i < need; ++i) beam.push_back(uniq[keep + static_cast<size_t>(i) * rest / need]); // çeşitlilik
             } else {
                 beam = uniq;
             }
@@ -597,40 +644,26 @@ namespace {
             auto& order = B.order;
             order.clear();
             for (int idx : beam) {
+                // plan sonunda yerde olmak güvenlidir (iyi botların kullandığı puan)
                 float c = nodes[idx].cost + ((groundMode(nodes[idx].s.mode) && !nodes[idx].s.grounded) ? 15.f : 0.f);
                 order.push_back({c, idx});
             }
             std::sort(order.begin(), order.end());
-
-            // ULTRA SAFE PLAN SEÇİMİ: simMargin kadar net boşluk yoksa kabul etme
+            // Adaylar arasında tehlikeden en geniş boşlukla geçeni seç (model hatası tamponu).
+            // Eşitlikte (±0.25) en düşük maliyetli kalır.
             float bestScore = -1e9f;
             int tried = 0;
-            const int maxTries = std::min(50, static_cast<int>(order.size()));
             for (auto& pr : order) {
-                if (++tried > maxTries) break;
+                if (++tried > 16) break;
                 auto plan = extractPlan(nodes, pr.second);
-                const float clr = replayClearance(root, plan, 480, W, C, simMargin);
+                const float clr = replayClearance(root, plan, 480, W, C);
                 if (clr <= kDead * 0.5f) continue;
-                
-                // Eğer simMargin'den daha fazla boşluk varsa direkt kabul et (en güvenli)
-                if (clr >= simMargin) {
-                    bestScore = clr;
-                    chosen = pr.second;
-                    out.plan = std::move(plan);
-                    break; 
-                }
-                
-                // Yoksa en yüksek clearance'a sahip olanı seç
-                if (clr > bestScore + 0.5f) {
-                    bestScore = clr; 
-                    chosen = pr.second; 
-                    out.plan = std::move(plan);
+                const float score = std::min(clr, marginBase);
+                if (score > bestScore + 0.25f) {
+                    bestScore = score; chosen = pr.second; out.plan = std::move(plan);
                 }
             }
-            if (chosen < 0) {
-                chosen = order[0].second;
-                out.plan = extractPlan(nodes, chosen);
-            }
+            if (chosen < 0) { chosen = order[0].second; out.plan = extractPlan(nodes, chosen); }
         } else if (bestDead >= 0) {
             chosen = bestDead;
             out.plan = extractPlan(nodes, chosen);
@@ -649,8 +682,7 @@ namespace {
                 out.lines.push_back(std::move(pl)); ++deadShown;
             }
             if (chosen >= 0 && !out.plan.empty()) {
-                PathLine pl; pl.kind = 2; pathFromPlan(root, out.plan, W, C, simMargin, pl);
-                out.lines.push_back(std::move(pl));
+                PathLine pl; pl.kind = 2; pathFromPlan(root, out.plan, W, C, pl); out.lines.push_back(std::move(pl));
             }
         }
         return out;
@@ -661,18 +693,22 @@ namespace {
         return (m >= 0 && m < M_COUNT) ? n[m] : "?";
     }
 
+    // Obje sınıflandırma (ID tabanlı: tüm orb / pad / portal)
     bool classify(int id, GameObjectType type, Obj& o) {
         switch (id) {
+            // pad
             case 35:   o.kind = Kind::Pad;  o.sub = E_YELLOW; return true;
             case 140:  o.kind = Kind::Pad;  o.sub = E_PINK;   return true;
             case 1332: o.kind = Kind::Pad;  o.sub = E_RED;    return true;
             case 67:   o.kind = Kind::Pad;  o.sub = E_BLUE;   return true;
+            // orb
             case 36:   o.kind = Kind::Ring; o.sub = E_YELLOW; return true;
             case 141:  o.kind = Kind::Ring; o.sub = E_PINK;   return true;
             case 1333: o.kind = Kind::Ring; o.sub = E_RED;    return true;
             case 84:   o.kind = Kind::Ring; o.sub = E_BLUE;   return true;
             case 1022: o.kind = Kind::Ring; o.sub = E_GREEN;  return true;
             case 1330: o.kind = Kind::Ring; o.sub = E_BLACK;  return true;
+            // mod portalları
             case 12:   o.kind = Kind::Portal; o.sub = PT_MODE; o.mode = M_CUBE;   return true;
             case 13:   o.kind = Kind::Portal; o.sub = PT_MODE; o.mode = M_SHIP;   return true;
             case 47:   o.kind = Kind::Portal; o.sub = PT_MODE; o.mode = M_BALL;   return true;
@@ -681,6 +717,7 @@ namespace {
             case 745:  o.kind = Kind::Portal; o.sub = PT_MODE; o.mode = M_ROBOT;  return true;
             case 1331: o.kind = Kind::Portal; o.sub = PT_MODE; o.mode = M_SPIDER; return true;
             case 1933: o.kind = Kind::Portal; o.sub = PT_MODE; o.mode = M_SWING;  return true;
+            // yerçekimi / boyut / hız portalları
             case 10:   o.kind = Kind::Portal; o.sub = PT_GRAV_N; return true;
             case 11:   o.kind = Kind::Portal; o.sub = PT_GRAV_F; return true;
             case 2926: o.kind = Kind::Portal; o.sub = PT_GRAV_T; return true;
@@ -693,13 +730,6 @@ namespace {
             case 1334: o.kind = Kind::Portal; o.sub = PT_SPEED; o.val = 576.f;   return true;
             default: break;
         }
-
-        // ZORLA HAZARD: Bazı spike'lar Solid dönüyor, bot üstüne basıp ölüyor.
-        if (id == 8 || id == 9 || id == 39 || id == 103 || id == 104 || id == 105 || id == 392 || id == 394) {
-            o.kind = Kind::Hazard;
-            return true;
-        }
-
         switch (type) {
             case GameObjectType::Hazard:         o.kind = Kind::Hazard; return true;
             case GameObjectType::Solid:          o.kind = Kind::Solid;  return true;
@@ -714,6 +744,7 @@ namespace {
         }
     }
 
+    // Slope yüzey çizgisi: dönüş (90'ın katı) ve flip'e göre hipotenüs
     void slopeLine(GameObject* go, Obj& o) {
         int rot = static_cast<int>(std::lround(go->getRotation() / 90.f)) % 4;
         if (rot < 0) rot += 4;
@@ -735,7 +766,7 @@ namespace {
         float ratio = (qy - py) / (qx - px);
         float yline = py + (std::clamp(rx, px, qx) - px) * ratio;
         o.lx = px; o.ly = py; o.rx = qx; o.ry = qy;
-        o.sub = (ry < yline) ? 1 : 0;
+        o.sub = (ry < yline) ? 1 : 0;   // 1: katı çizginin altında
     }
 }
 
@@ -763,7 +794,7 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         float flipSign = 1.f;
         int flipEvid = 0;
         int robotBoost = 0;
-        std::vector<std::pair<float, float>> usedRings;
+        std::vector<std::pair<float, float>> usedRings;   // botun tıkladığı ring'ler (x0, y0)
 
         long tick = 0;
         long lastSearch = -1000;
@@ -772,10 +803,11 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
 
         CCDrawNode* drawNode = nullptr;
 
+        // ---- teşhis ----
         struct Unsup { float x, y; int id; };
-        std::vector<Unsup> unsup;
+        std::vector<Unsup> unsup;                  // simüle edilmeyen objeler
         int cntDash = 0, cntDual = 0, cntTele = 0, cntMirror = 0, cntTrig = 0;
-        S pred; bool predValid = false;
+        S pred; bool predValid = false;            // bir önceki adımda yaptığımız tahmin
         float errY[M_COUNT] = {}, errV[M_COUNT] = {};
         float lastErrY = 0.f, lastErrV = 0.f;
         int bigErr = 0, inputMismatch = 0;
@@ -785,14 +817,6 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         bool deadReported = false;
         long reportUntil = 0;
         CCLabelBMFont* reportLabel = nullptr;
-
-        float startX = -1e9f;
-        float maxX = -1e9f;
-        int stuckFrames = 0;
-        int escalation = 0;
-        long lastProgressTick = 0;
-        long lastEscalationTick = 0;
-        int desperateFrames = 0;
     };
 
     void rebuildCache() {
@@ -808,7 +832,7 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
             Obj o;
             CCRect r = go->getObjectRect();
             o.x0 = r.getMinX(); o.x1 = r.getMaxX(); o.y0 = r.getMinY(); o.y1 = r.getMaxY();
-            {
+            {   // bot'un simüle etmediği ama oynanışı etkileyen objeleri say (teşhis için)
                 const int oid = go->m_objectID;
                 bool u = true;
                 if (oid == 1704 || oid == 1751) ++f->cntDash;
@@ -820,13 +844,6 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
                 if (u) f->unsup.push_back({(o.x0 + o.x1) * 0.5f, (o.y0 + o.y1) * 0.5f, oid});
             }
             if (!classify(go->m_objectID, go->m_objectType, o)) continue;
-            
-            // TEHLİKELERE SANAL ZIRH: Hitbox'ları büyüt ki kıl payı geçiş imkansız olsun
-            if (o.kind == Kind::Hazard) {
-                o.x0 -= 6.f; o.x1 += 6.f;
-                o.y0 -= 6.f; o.y1 += 6.f;
-            }
-
             if (o.kind == Kind::Slope) slopeLine(go, o);
             f->objs.push_back(o);
         }
@@ -891,9 +908,6 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         auto f = m_fields.self();
         f->havePrev = false; f->plan.clear(); f->planPos = 0; f->lastSearch = -1000; f->acc = 0.f;
         f->usedRings.clear(); f->robotBoost = 0;
-        f->vx = 0.f;
-        f->startX = -1e9f; f->maxX = -1e9f; f->stuckFrames = 0; f->escalation = 0;
-        f->lastProgressTick = f->tick; f->lastEscalationTick = f->tick; f->desperateFrames = 0;
         releaseAll();
     }
 
@@ -929,6 +943,7 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         f->reportUntil = f->tick + ticks;
     }
 
+    // Ölüm raporu: neden öldüğünü ekranda gösterir (ekran görüntüsü alıp gönder)
     void buildDeathReport() {
         auto f = m_fields.self();
         if (!f->haveLastRoot) return;
@@ -953,23 +968,24 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
                 if (nearTxt.find(nm) == std::string::npos) nearTxt += std::string(nm) + " ";
             }
         }
-        const char* why = !f->lastSurvived ? "Planlayici COZUM BULAMADI"
-                          : (f->bigErr > 0 ? "Model SAPTI" : "Plan bulundu ama yine de oldu");
+        const char* why = !f->lastSurvived ? "Planlayici COZUM BULAMADI (model 'olum kacinilmaz' dedi)"
+                          : (f->bigErr > 0 ? "Model SAPTI: tahmin gercekle uyusmadi" : "Planlayici cozum buldu ama yine de oldu");
         char buf[1024];
         std::snprintf(buf, sizeof buf,
-            "OLUM x=%.0f y=%.0f mod=%s g=%+.0f mini=%d hiz=%.0f\n"
-            "%s | esc=%d stuck=%d\n"
-            "sapma son dy=%.2f dv=%.2f | ort dy=%.2f dv=%.2f | buyuk sapma=%d\n"
-            "giris uyusmazligi=%d | tehlike=%d blok=%d pad=%d orb=%d portal=%d\n"
-            "DESTEK YOK: %s | dash=%d dual=%d tele=%d ayna=%d trig=%d\n"
-            "kalib: kPos=%.4f jumpV=%.2f ufoV=%.2f",
-            r.x, r.y, modeName(r.mode), r.g, r.mini ? 1 : 0, r.vx,
-            why, f->escalation, f->stuckFrames,
-            f->lastErrY, f->lastErrV, f->errY[r.mode], f->errV[r.mode], f->bigErr,
+            "OLUM x=%.0f y=%.0f mod=%s g=%+.0f mini=%d hiz=%.0f zemin=%d\n"
+            "%s\n"
+            "sapma son dy=%.2f dv=%.2f | ort(%s) dy=%.2f dv=%.2f | buyuk sapma=%d (son x=%.0f)\n"
+            "giris uyusmazligi=%d | yakin: tehlike=%d blok/slope=%d pad=%d orb=%d portal=%d\n"
+            "YAKINDA DESTEKLENMEYEN: %s\n"
+            "level: dash=%d dual=%d teleport=%d ayna=%d trigger=%d\n"
+            "kalib: kPos=%.4f gMult=%.3f jumpV=%.2f ufoV=%.2f",
+            r.x, r.y, modeName(r.mode), r.g, r.mini ? 1 : 0, r.vx, r.grounded ? 1 : 0,
+            why,
+            f->lastErrY, f->lastErrV, modeName(r.mode), f->errY[r.mode], f->errV[r.mode], f->bigErr, f->lastBigErrX,
             f->inputMismatch, nh, ns, np, no, nt,
             nearTxt.empty() ? "yok" : nearTxt.c_str(),
             f->cntDash, f->cntDual, f->cntTele, f->cntMirror, f->cntTrig,
-            C.kPos, C.jumpV, C.ufoV);
+            C.kPos, C.gMult[r.mode], C.jumpV, C.ufoV);
         showReport(buf, 240 * 12);
         log::info("{}", buf);
     }
@@ -1015,27 +1031,15 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         const bool debug = Mod::get()->getSettingValue<bool>("debug-log");
         const bool autoCal = Mod::get()->getSettingValue<bool>("auto-calibrate");
 
-        if (f->startX < -1e8f) { f->startX = px; f->maxX = px; f->lastProgressTick = f->tick; }
-        if (px > f->maxX + 1.f) {
-            f->maxX = px; f->stuckFrames = 0; f->lastProgressTick = f->tick;
-        } else if (f->maxX - px > 5.f) {
-            f->stuckFrames++;
-        }
-        if (f->stuckFrames > 120 && f->tick - f->lastEscalationTick > 90) {
-            f->escalation = std::min(3, f->escalation + 1);
-            f->lastEscalationTick = f->tick;
-            f->stuckFrames = 0;
-        }
-        if (f->escalation > 0 && f->tick - f->lastProgressTick > 600) {
-            f->escalation = 0;
-        }
-
+        // ---------- canlı kalibrasyon ----------
         if (f->havePrev) {
+            // yatay hız: konum farkından doğrudan oku (hız portalından sonra anında doğru)
             float vxm = (px - f->prevX) / dtp;
             if (vxm > 150.f && vxm < 800.f) {
                 if (f->vx <= 0.f || std::fabs(vxm - f->vx) > 25.f) f->vx = vxm;
                 else f->vx = f->vx * 0.5f + vxm * 0.5f;
             }
+
             if (g < 0.f && f->prevG < 0.f && !grounded && !f->prevGrounded) {
                 float dy = py - f->prevY;
                 if (std::fabs(dy) > 0.3f && std::fabs(vyRaw) > 1.f) {
@@ -1044,11 +1048,14 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
                     if (f->flipEvid <= -3) f->flipSign = -1.f;
                 }
             }
+
             const bool sameState = autoCal && (mode == f->prevMode && g == f->prevG && steps == 1);
             const bool pressed = f->held && !f->held2;
             const bool airborne = !grounded && !f->prevGrounded;
             const float duU = (vyW - f->prevVyW) * g;
             const float gstep = G0 * C.kPos;
+
+            // dikey konum ölçeği: dy = kPos * ortalama hız (yalnızca pürüzsüz havada kalma adımlarında)
             if (sameState && airborne && mode != M_WAVE && std::fabs(vyW - f->prevVyW) < 0.6f) {
                 float vAvg = 0.5f * (vyW + f->prevVyW);
                 if (std::fabs(vAvg) > 2.f) {
@@ -1056,6 +1063,7 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
                     if (ke > 0.15f && ke < 0.35f) C.kPos = C.kPos * 0.95f + ke * 0.05f;
                 }
             }
+
             if (sameState && airborne && !pressed && mode != M_SHIP && mode != M_WAVE) {
                 bool boosting = (mode == M_ROBOT && f->held);
                 if (!boosting && duU < -0.004f && duU > -0.6f) {
@@ -1066,11 +1074,10 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
             if (sameState && mode == M_SHIP && !grounded) {
                 float uPrev = f->prevVyW * g;
                 int ci = f->held ? (uPrev >= 0.f ? 0 : 1) : (uPrev > 0.f ? 2 : 3);
-                float acc2 = f->held ? duU : -duU;
+                float acc = f->held ? duU : -duU;
                 float curU = vyW * g;
-                if (acc2 > 0.002f && acc2 < 0.5f && std::fabs(curU) < C.shipUp - 0.2f && curU > -C.shipDown + 0.2f) {
-                    C.shipAcc[ci] = std::clamp(C.shipAcc[ci] * 0.9f + acc2 * 0.1f, 0.02f * G0 * K, 0.8f * G0 * K);
-                }
+                if (acc > 0.002f && acc < 0.5f && std::fabs(curU) < C.shipUp - 0.2f && curU > -C.shipDown + 0.2f)
+                    C.shipAcc[ci] = C.shipAcc[ci] * 0.9f + acc * 0.1f;
             }
             if (mode == M_CUBE && f->prevMode == M_CUBE && f->prevGrounded && !grounded && f->held && vyW * g > 3.f) {
                 float jm = (vyW * g + gstep * C.gMult[M_CUBE]) / (mini ? 0.8f : 1.f);
@@ -1082,6 +1089,7 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
             }
         }
 
+        // tahmin-gerçek karşılaştırması (teşhis): önceki adımda yaptığımız 1 adımlık tahmin ne kadar tuttu?
         if (f->predValid && steps == 1) {
             const float ey = std::fabs(f->pred.y - py), ev = std::fabs(f->pred.vy - vyW);
             f->lastErrY = ey; f->lastErrV = ev;
@@ -1094,14 +1102,11 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         }
         f->predValid = false;
 
+        // robot zıplama sayacı (simülasyonun kök durumu için)
         if (mode == M_ROBOT) {
-            if (f->prevMode == M_ROBOT && f->prevGrounded && !grounded && f->held) {
-                f->robotBoost = 67;
-            } else if (f->robotBoost > 0 && f->held && !grounded) {
-                f->robotBoost = std::max(0, f->robotBoost - steps);
-            } else {
-                f->robotBoost = 0;
-            }
+            if (f->prevMode == M_ROBOT && f->prevGrounded && !grounded && f->held) f->robotBoost = std::max(0, 67 - steps);
+            else if (f->robotBoost > 0 && f->held && !grounded) f->robotBoost = std::max(0, f->robotBoost - steps);
+            else f->robotBoost = 0;
         } else {
             f->robotBoost = 0;
         }
@@ -1111,8 +1116,9 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         f->prevMode = mode; f->prevGrounded = grounded;
         if (f->vx <= 0.f) f->vx = 311.58f;
 
+        // ---------- durum + yerel dünya ----------
         const float look = static_cast<float>(Mod::get()->getSettingValue<double>("look-ahead"));
-        int horizonSteps = std::clamp(static_cast<int>(look * 240.f), 120, 2400);
+        const int horizonSteps = std::clamp(static_cast<int>(look * 240.f), 120, 2400);
         const float reach = f->vx * look * 1.3f + 80.f;
         if (f->gatherReach <= 0.f || px < f->gatherX || px > f->gatherX + 150.f || reach > f->gatherReach - 150.f)
             gather(px, reach + 200.f);
@@ -1126,6 +1132,7 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         root.robotBoost = static_cast<int16_t>(f->robotBoost);
         const float halfNow = halfOf(root);
 
+        // zemin kalibrasyonu (mod alanından ÖNCE; yalnızca gerçek zemindeyken ve küçük kaymalarla)
         if (grounded && g > 0.f && (mode == M_CUBE || mode == M_ROBOT)) {
             bool onObj = false;
             for (int i = 0; i < n && !onObj; ++i) {
@@ -1141,12 +1148,14 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
             }
         }
         root.gb = C.groundB;
-        {
+        {   // mod alanı: son geçilen mod portalından
             float pc = py;
             for (auto& p : f->modePortals) { if (p.x1 <= px + 1.f) pc = (p.y0 + p.y1) * 0.5f; else break; }
             areaFromCenter(root, mode, pc);
         }
 
+        // Oyuncunun şu an içinde olduğu pad/portal ve botun tıkladığı ring'ler oyunda ZATEN tetiklendi:
+        // kök durumda "kullanılmış" işaretle ki simülasyon onları ikinci kez tetiklemesin.
         {
             for (const Obj& o : f->local) {
                 if (o.x0 > px + halfNow + 2.f) break;
@@ -1160,33 +1169,22 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
             ur.erase(std::remove_if(ur.begin(), ur.end(), [&](const std::pair<float, float>& p) { return p.first < px - 300.f; }), ur.end());
         }
 
-        // ULTRA SAFE: Minimum 12 birim güvenlik payı
-        const float baseMargin = std::clamp(static_cast<float>(Mod::get()->getSettingValue<double>("safety-margin")), 0.f, 14.f);
-        float effMargin = baseMargin;
-        if (f->escalation >= 2) effMargin *= 0.8f;
-        if (f->escalation >= 3) effMargin *= 0.6f;
-        const float simMargin = std::max(12.f, std::min(16.f, effMargin * 1.2f));
-
-        bool need = f->plan.empty() || f->planPos + 24 > f->plan.size() || !f->lastSurvived;
-        if (!need) need = !replayAlive(root, f->plan, f->planPos, 120, W, C, simMargin);
+        // ---------- plan: yakın geleceği doğrula, gerekirse yeniden ara ----------
+        if (!f->plan.empty()) f->planPos += steps;
+        bool need = f->plan.empty() || f->planPos + 24 > f->plan.size();
+        if (!need) need = !replayAlive(root, f->plan, f->planPos, 120, W, C, 0.f);
         const int interval = std::clamp(static_cast<int>(std::ceil(f->searchMs / 0.6f)), 6, 48);
         if (!need && f->tick - f->lastSearch >= interval) need = true;
+        // bot kapalıyken sadece çizim için, seyrek ara
         if (!active) need = showTraj && (f->tick - f->lastDraw >= 12);
 
         if (need) {
-            int baseKb = std::clamp(static_cast<int>(Mod::get()->getSettingValue<int64_t>("trajectory-count")), 4, 100);
-            if (f->searchMs > 12.f) baseKb = std::max(8, static_cast<int>(baseKb * 12.f / f->searchMs));
-            int Kb = baseKb;
-            int horizon = horizonSteps;
-            if (f->escalation >= 1) Kb = std::min(150, Kb * 2);
-            if (f->escalation >= 2) { Kb = std::min(150, Kb * 2); horizon = std::min(2400, horizon + 480); }
-            if (f->escalation >= 3) { Kb = std::min(180, Kb); horizon = 2400; }
-            if (f->desperateFrames > 300) { Kb = std::max(4, baseKb / 2); horizon = std::min(horizon, 300); }
-            if (f->searchMs > 25.f && f->escalation > 0) Kb = std::max(baseKb / 2, Kb / 2);
-
+            int Kb = std::clamp(static_cast<int>(Mod::get()->getSettingValue<int64_t>("trajectory-count")), 4, 100);
+            if (f->searchMs > 12.f) Kb = std::max(8, static_cast<int>(Kb * 12.f / f->searchMs));   // yavaşsa otomatik küçült
+            const float marginBase = std::clamp(static_cast<float>(Mod::get()->getSettingValue<double>("safety-margin")), 0.f, 14.f);
             const bool draw = showTraj && (f->tick - f->lastDraw >= 12);
             auto t0 = std::chrono::steady_clock::now();
-            auto res = runSearch(root, W, C, Kb, horizon, draw, effMargin, simMargin,
+            auto res = runSearch(root, W, C, Kb, horizonSteps, draw, marginBase,
                                  f->plan.empty() ? nullptr : &f->plan, f->planPos);
             float ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
             f->searchMs = f->searchMs * 0.8f + ms * 0.2f;
@@ -1194,30 +1192,18 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
             f->plan = std::move(res.plan);
             f->planPos = 0;
             f->lastSearch = f->tick;
-            if (res.survived) f->desperateFrames = 0;
-            else f->desperateFrames++;
             if (draw) { drawLines(res.lines); f->lastDraw = f->tick; }
-            if (debug) {
-                log::info("SEARCH survived={} Kb={} horizon={} esc={} ms={:.2f} simM={:.1f}",
-                          res.survived ? 1 : 0, Kb, horizon, f->escalation, ms, simMargin);
-            }
         }
 
         f->lastRoot = root; f->haveLastRoot = true;
 
+        // ---------- eylem ----------
         bool want = false;
-        if (!f->plan.empty() && f->planPos < f->plan.size()) {
-            int ones = 0, total = 0;
-            for (int i = 0; i < steps && f->planPos + i < f->plan.size(); ++i) {
-                ones += f->plan[f->planPos + i];
-                ++total;
-            }
-            want = total > 0 && (ones * 2 >= total);
-        }
+        if (!f->plan.empty()) want = f->plan[std::min(f->planPos, f->plan.size() - 1)] != 0;
         if (!active) want = false;
         if (want != f->held) {
             this->handleButton(want, 1, true);
-            if (want) {
+            if (want) {   // yeni basış: üstünde olduğumuz ilk ring'i kullanılmış say (simülasyonla aynı sıra)
                 for (const Obj& o : f->local) {
                     if (o.x0 > px + halfNow + 10.f) break;
                     if (o.kind == Kind::Ring && !ringUsed(o) && ovr(px, py, halfNow, o, 0.f)) {
@@ -1227,14 +1213,14 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
                 }
             }
             if (debug) {
-                log::info("INPUT {} mode={} x={:.1f} y={:.1f} vy={:.2f} vx={:.1f} esc={} searchMs={:.2f}",
-                          want ? "DOWN" : "UP", mode, px, py, vyW, f->vx, f->escalation, f->searchMs);
+                log::info("INPUT {} mode={} x={:.1f} y={:.1f} vy={:.2f} vx={:.1f} gMult={:.3f} jumpV={:.2f} kPos={:.4f} searchMs={:.2f}",
+                          want ? "DOWN" : "UP", mode, px, py, vyW, f->vx, C.gMult[mode], C.jumpV, C.kPos, f->searchMs);
             }
         }
         f->held2 = f->held;
         f->held = want;
 
-        {
+        {   // bir sonraki adım için tahmin (teşhis)
             S p = root; p.prevHeld = root.held; p.held = want;
             f->predValid = stepSim(p, W, C, 0.f);
             f->pred = p;
@@ -1272,7 +1258,7 @@ class $modify(CubeBotPause, PauseLayer) {
 
     void onToggleBot(CCObject* sender) {
         auto t = static_cast<CCMenuItemToggler*>(sender);
-        bool newValue = !t->isToggled();
+        bool newValue = !t->isToggled();   // callback anında eski durum
         Mod::get()->setSettingValue<bool>("bot-active", newValue);
     }
 };
