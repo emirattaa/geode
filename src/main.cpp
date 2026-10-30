@@ -1,36 +1,26 @@
-// Geode Autoplay v0.10 - tüm modlar, orb/pad/portal/slope, beam search planlama
+// Geode Autoplay v0.11 - tüm modlar, orb/pad/portal/slope, beam search planlama
 //
-// v0.9 -> v0.10: [KRİTİK] ZEMİN BUG'I. Eski kalibrasyon, bot bir blok/slope üstündeyken ilk örneği "zemin" sanıp
-//   kalıcı olarak yanlış öğrenebiliyordu (zemin = blok üstü). Bu durumda bot çukurları/dikenleri hiç görmüyor,
-//   düz bir yol tahmin edip zıplamıyordu. Artık zemin varsayılan 90; yalnızca aşağı doğru düzeltilir, yukarı doğru
-//   düzeltme sadece altında hiç blok/slope yokken ve 30 kare üst üste aynı değerde olursa yapılır. Her ölümde sıfırlanır.
-//   jumpV kalibrasyonu da slope fırlatmasından etkilenmeyecek şekilde daraltıldı.
+// v0.10 -> v0.11:
+//  * DASH ORB desteği (yeşil 1704, pembe 1751 = yerçekimi çeviren): simülasyonda dash durumu var.
+//    Desteklenmeyen obje sayacından çıkarıldı. Dash hız çarpanı Cfg::dashMul (oyunda doğrula).
+//  * Sınıflanmayan (bilinmeyen) objelerin ID'leri log'a yazılır -> eksik orb ID'lerini bulmak için.
+//  * ORB ZAMANLAMASI: orb/pad yakınında arama adımı 2'ye iner (uzak kısımda kaba adım orbu kaçırıyordu).
+//  * WAVE DUVAR HATASI: eski "snap=6" toleransı yandan giren wave'i bloğun üstüne ışınlıyordu (duvara
+//    değebiliyordu). Artık sadece bir adımlık dikey kayma payı var; derin gömülme = yan çarpma = ölüm.
+//    Wave slope toleransı da daraltıldı.
+//  * TRAJECTORY: bakış süresi 20 sn'ye (4800 adım) çıktı, her frame yeniden planlanır ve çizilir.
+//    Arama süresi 6 ms'yi geçerse beam otomatik küçülür. Çizilen yol daha uzun.
+//  * Uçan modlarda yükseklik koruma cezası 0.08 -> 0.02 (boşluğa gitmeyi engelliyordu).
 //
-// v0.8 -> v0.9: TEŞHİS. Ölünce ekranda "ölüm raporu" çıkar (neden öldü: planlayıcı çözüm bulamadı mı, model gerçekten
-//   saptı mı, desteklenmeyen obje mi var). Level'deki desteklenmeyen objeler (dash orb, dual, teleport, ayna, trigger)
-//   sayılır. "Otomatik kalibrasyon" ayarı eklendi (kapatınca sabit fizik sabitleri kullanılır).
+// v0.9 -> v0.10: [KRİTİK] ZEMİN BUG'I. Zemin varsayılan 90; yalnızca aşağı doğru düzeltilir, yukarı doğru
+//   düzeltme sadece altında hiç blok/slope yokken ve 30 kare üst üste aynı değerde olursa yapılır.
+//   Her ölümde sıfırlanır. jumpV kalibrasyonu slope fırlatmasından etkilenmez.
 //
-// v0.7 -> v0.8 değişiklikleri:
-//  * SON ANDA ATLAMA düzeltildi: arama artık tehlikeye olan mesafeyi (clearance) ölçüyor, tehlikeye yaklaşmayı cezalandırıyor
-//    ve eski "geç tıkla" önyargısı kaldırıldı. Son plan, en geniş boşluğu bırakan adaydan seçiliyor.
-//  * UZAK SİMÜLASYON: bakış süresi 10 saniyeye (2400 adım) çıktı. Uzak kısım çok çözünürlüklü aranır (3/5/10/20 adım).
-//    Seçilen yol artık adım adım yeniden oynatılıp pürüzsüz ve uzun çizilir.
-//  * WAVE: slope'lar artık simülasyonda var (wave üstünden kayar, eskiden içinden geçiyordu); yan çarpma toleransı
-//    daraltıldı; wave/ship için daha ince giriş adımı (1/2 adım) kullanılır.
+// v0.8 -> v0.9: TEŞHİS. Ölünce ekranda "ölüm raporu". "Otomatik kalibrasyon" ayarı.
 //
-// v0.6 -> v0.7 değişiklikleri:
-//  * [ANA BUG] Her yeniden planlamada kök durumun "kullanılmış" bitleri sıfırdı. Oyuncunun içinde durduğu
-//    pad / portal simülasyonda TEKRAR tetikleniyordu (gravity-toggle portalı iki kez çeviriyor, pad tekrar
-//    fırlatıyor, plan çöpe dönüyordu). Artık üstündeki pad/portal ve botun tıkladığı ring'ler kullanılmış sayılır.
-//  * Dikey konum ölçeği (kPos) oyundan canlı kalibre edilir. Eski sabit 0.225 yanlışsa zıplama yüksekliği/süresi
-//    kayıyordu; yerçekimi kalibrasyonu da aynı ölçeğe bağlandı.
-//  * Zemin (groundB) kalibrasyonu artık bir platformun üstünde yanlışlıkla bozulmuyor; ve alan hesabından ÖNCE yapılıyor.
-//  * Hız (vx) hız portallarından sonra anında doğru okunuyor (eskiden EMA gecikmesi vardı).
-//  * Robot zıplama sayacı gerçek oyundan takip ediliyor.
-//  * Beam search: tamponlar yeniden kullanılıyor (kare takılması azalır), daha iyi hash, önceki plana yapışma
-//    (titreşen giriş azalır), "güvenlik payı" ayarı, bot kapalıyken sadece çizim için seyrek arama.
-//  * Yerel dünya her adımda değil, gerektiğinde toplanıyor (CPU); limit 900 -> 12000 obje.
-//  * used bit sayısı 128 -> 512.
+// v0.7 -> v0.8: son anda atlama düzeltmesi (clearance), uzak simülasyon, wave slope'ları.
+//
+// v0.6 -> v0.7: kullanılmış orb/portal bitleri, canlı kPos kalibrasyonu, beam tampon yeniden kullanımı vb.
 //
 // Fizik kaynakları (GD 2.2081 decompile'larından türetilmiş, topluluk projeleri):
 //  - 240 Hz adım, hız birimi: 1 birim = kPos koordinat/adım (varsayılan 0.225, canlı ölçülür)
@@ -50,6 +40,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -65,7 +56,7 @@ namespace {
 
     enum Mode : int { M_CUBE = 0, M_SHIP, M_BALL, M_UFO, M_WAVE, M_ROBOT, M_SPIDER, M_SWING, M_COUNT };
     enum class Kind : uint8_t { Hazard, Solid, Slope, Pad, Ring, Portal };
-    enum Eff : uint8_t { E_YELLOW, E_PINK, E_RED, E_BLUE, E_GREEN, E_BLACK };
+    enum Eff : uint8_t { E_YELLOW, E_PINK, E_RED, E_BLUE, E_GREEN, E_BLACK, E_DASH, E_DASHG };
     enum PortalT : uint8_t { PT_MODE, PT_GRAV_N, PT_GRAV_F, PT_GRAV_T, PT_MINI, PT_BIG, PT_SPEED };
 
     struct Obj {
@@ -76,6 +67,7 @@ namespace {
         int16_t orb = -1;     // "bir kez tetiklendi" bit indeksi
         float lx = 0, ly = 0, rx = 1, ry = 0; // slope yüzey çizgisi (soldan sağa)
         float val = 0;        // hız portalı
+        float ang = 0;        // objenin dönüşü (derece): dash orb yönü
     };
 
     struct Cfg {
@@ -87,6 +79,7 @@ namespace {
         float shipUp = 8.f, shipDown = 6.4f;
         float groundB = 90.f;
         float kPos = K;       // koordinat / (hız birimi * adım)
+        float dashMul = 2.f;  // dash sırasında yatay hız çarpanı (oyunda ölçüp doğrula)
     };
 
     struct S {
@@ -95,9 +88,11 @@ namespace {
         float B = 90.f, T = kInf;    // mod alanı alt/üst sınırı
         float gb = 90.f;             // zemin
         float slope = 0.f;
+        float dashK = 0.f;           // dash eğimi (dy/dx)
         int8_t mode = 0;
         int16_t robotBoost = 0;
         bool mini = false, grounded = true, held = false, prevHeld = false, onSlope = false;
+        bool dashing = false;
         float clr = kInf;            // tehlikeye en yakın ayrılık (birim); sadece planlama için
         uint64_t used[kMaxOrb / 64] = {};
     };
@@ -132,6 +127,16 @@ namespace {
         return static_cast<int>(std::lower_bound(W.pm, W.pm + W.n, minX) - W.pm);
     }
 
+    // x civarında (reach ileriye) orb/pad var mı? Varsa arama adımı inceltilir.
+    inline bool actionNear(const World& W, float x, float reach) {
+        for (int i = firstIdx(W, x - 40.f); i < W.n && W.L[i].x0 <= x + reach; ++i) {
+            const Obj& o = W.L[i];
+            if (o.x1 < x - 40.f) continue;
+            if (o.kind == Kind::Ring || o.kind == Kind::Pad) return true;
+        }
+        return false;
+    }
+
     void areaFromCenter(S& s, int mode, float pc) {
         float H = modeHeight(mode);
         if (H >= kInf) { s.B = s.gb; s.T = kInf; return; }
@@ -141,8 +146,16 @@ namespace {
         if (s.y + 15.f > s.T) s.T = s.y + 15.f;
     }
 
-    // Orb / pad etkisi (hız birimi: oyunun native birimi)
-    void orbFx(S& s, uint8_t eff, float jv, bool pad) {
+    // Orb / pad etkisi (hız birimi: oyunun native birimi). ang: dash orb dönüşü (derece)
+    void orbFx(S& s, uint8_t eff, float jv, bool pad, float ang) {
+        if (eff == E_DASH || eff == E_DASHG) {
+            if (pad) return;
+            if (eff == E_DASHG) s.g = -s.g;
+            s.dashing = true;
+            s.dashK = std::clamp(std::tan(-ang * 0.01745329f), -6.f, 6.f);
+            s.vy = 0.f; s.grounded = false; s.onSlope = false; s.robotBoost = 0;
+            return;
+        }
         const float base = pad ? 16.f : jv;
         if (s.mode == M_WAVE) {                       // wave: sadece yerçekimi değişir
             if (eff == E_BLUE || eff == E_GREEN) s.g = -s.g;
@@ -156,6 +169,7 @@ namespace {
             case E_BLUE:   s.g = -s.g; s.vy = s.g * (-0.4f * base * mm); break;
             case E_GREEN:  s.g = -s.g; s.vy = s.g * (-0.9f * base * mm); break;
             case E_BLACK:  s.vy = s.g * (-15.f); break;
+            default: break;
         }
         s.grounded = false; s.onSlope = false;
     }
@@ -224,7 +238,7 @@ namespace {
         const bool press = s.held && !s.prevHeld;
         const float prevY = s.y;
 
-        if (!wave && !fly && s.grounded) {
+        if (!wave && !fly && s.grounded && !s.dashing) {
             if (!supportedNow(s, W, half)) {
                 s.grounded = false;
                 if (s.onSlope) s.vy = s.slope * (s.vx / (240.f * C.kPos));
@@ -240,15 +254,18 @@ namespace {
                 if (o.kind != Kind::Ring || isUsed(s, o.orb)) continue;
                 if (o.x1 < s.x - half - 10.f) continue;
                 if (ovr(s.x, s.y, half, o, 0.f)) {
-                    setUsed(s, o.orb); orbFx(s, o.sub, jv, false); consumed = true; break;
+                    setUsed(s, o.orb); orbFx(s, o.sub, jv, false, o.ang); consumed = true; break;
                 }
             }
         }
 
+        // dash: tuşu bırakınca biter
+        if (s.dashing && !s.held) { s.dashing = false; s.vy = 0.f; }
+
         float g = s.g, u = s.vy * g;
 
         // --- moda göre giriş ---
-        if (!consumed && !wave) {
+        if (!consumed && !wave && !s.dashing) {
             switch (s.mode) {
                 case M_CUBE:   if (s.grounded && s.held) { u = jv; s.grounded = false; s.onSlope = false; } break;
                 case M_ROBOT:  if (s.grounded && s.held) { u = 0.5f * jv; s.grounded = false; s.onSlope = false; s.robotBoost = 67; } break;
@@ -267,7 +284,11 @@ namespace {
         }
 
         // --- hız güncelle + konum ---
-        if (wave) {
+        const float mul = s.dashing ? C.dashMul : 1.f;
+        if (s.dashing) {
+            s.g = g; s.vy = 0.f;
+            s.y += s.dashK * dx * mul;
+        } else if (wave) {
             float dir = (s.held ? 1.f : -1.f) * g;
             s.y += dir * dx * (s.mini ? 2.f : 1.f);
             s.vy = 0.f;
@@ -291,7 +312,7 @@ namespace {
             s.g = g; s.vy = u * g;
             if (!s.grounded) s.y += s.vy * C.kPos;
         }
-        s.x += dx;
+        s.x += dx * mul;
 
         // --- mod alanı sınırları ---
         const float lo = s.B + half, hi = s.T - half;
@@ -324,10 +345,14 @@ namespace {
                 case Kind::Solid:
                     if (ovr(s.x, s.y, half, o, 0.f)) {
                         if (wave) {
-                            float prevFeet = prevY - half, prevHead = prevY + half;
-                            if (s.y < prevY && prevFeet >= o.y1 - snap)      s.y = o.y1 + half;
-                            else if (s.y > prevY && prevHead <= o.y0 + snap) s.y = o.y0 - half;
-                            else if (ovr(s.x, s.y, half * 0.8f, o, haz * 0.5f)) return false;   // wave: yan çarpma toleransı dar
+                            // Wave: sadece bir adımlık dikey kayma payı. Derin gömülme = yan çarpma = ölüm.
+                            const float dyW  = s.y - prevY;
+                            const float tolV = std::fabs(dyW) + 1.0f;
+                            const float penDown = o.y1 - (s.y - half);   // zemine gömülme
+                            const float penUp   = (s.y + half) - o.y0;   // tavana gömülme
+                            if (penDown <= tolV && penDown <= penUp)      s.y = o.y1 + half;
+                            else if (penUp <= tolV)                       s.y = o.y0 - half;
+                            else return false;
                         } else {
                             const float gg = s.g;
                             const float uu = s.vy * gg;
@@ -357,7 +382,7 @@ namespace {
                         const float xc = (floorType == (ratio > 0.f)) ? s.x + half : s.x - half;
                         if (xc >= o.lx - 0.5f && xc <= o.rx + 0.5f) {
                             const float ys = o.ly + (std::clamp(xc, o.lx, o.rx) - o.lx) * ratio;
-                            const float tol = snap + (1.f + std::fabs(ratio)) * std::fabs(dx) * (s.mini ? 2.f : 1.f) + 2.f;
+                            const float tol = (1.f + std::fabs(ratio)) * std::fabs(dx) * (s.mini ? 2.f : 1.f) + 1.5f;
                             if (floorType) {
                                 const float pen = ys - (s.y - half);
                                 if (pen > 0.f) { if (pen <= tol) s.y = ys + half; else return false; }
@@ -398,7 +423,7 @@ namespace {
 
                 case Kind::Pad:
                     if (!isUsed(s, o.orb) && ovr(s.x, s.y, half, o, 0.f)) {
-                        setUsed(s, o.orb); orbFx(s, o.sub, jv, true);
+                        setUsed(s, o.orb); orbFx(s, o.sub, jv, true, 0.f);
                     }
                     break;
 
@@ -412,7 +437,7 @@ namespace {
                             case PT_MODE:
                                 s.mode = static_cast<int8_t>(o.mode);
                                 areaFromCenter(s, o.mode, (o.y0 + o.y1) * 0.5f);
-                                s.grounded = false; s.onSlope = false; s.robotBoost = 0;
+                                s.grounded = false; s.onSlope = false; s.robotBoost = 0; s.dashing = false;
                                 break;
                             case PT_GRAV_N: s.g = 1.f; break;
                             case PT_GRAV_F: s.g = -1.f; break;
@@ -473,23 +498,13 @@ namespace {
         const int vq = static_cast<int>(std::lround(s.vy * 3.f));
         uint64_t flags = (s.held ? 1u : 0u) | (s.grounded ? 2u : 0u) | (s.g > 0.f ? 4u : 0u) |
                          (s.mini ? 8u : 0u) | (s.onSlope ? 16u : 0u) | (s.robotBoost > 0 ? 32u : 0u) |
+                         (s.dashing ? 64u : 0u) |
                          (static_cast<uint64_t>(s.mode) << 8);
         uint64_t k = mix64(static_cast<uint64_t>(static_cast<uint32_t>(yq + 1000000)));
         k = mix64(k ^ (static_cast<uint64_t>(static_cast<uint32_t>(vq + 1000000)) << 1));
         k = mix64(k ^ (flags * 0x9E3779B97F4A7C15ull));
         for (uint64_t w : s.used) k = mix64(k ^ w);
         return k;
-    }
-
-    bool replayAlive(const S& root, const std::vector<uint8_t>& plan, size_t from, size_t maxSteps,
-                     const World& W, const Cfg& C, float margin) {
-        S s = root;
-        size_t end = std::min(plan.size(), from + maxSteps);
-        for (size_t i = from; i < end; ++i) {
-            s.prevHeld = s.held; s.held = plan[i] != 0;
-            if (!stepSim(s, W, C, margin)) return false;
-        }
-        return true;
     }
 
     std::vector<uint8_t> extractPlan(const std::vector<Node>& nodes, int idx) {
@@ -527,7 +542,7 @@ namespace {
         for (size_t i = 0; i < plan.size(); ++i) {
             s.prevHeld = s.held; s.held = plan[i] != 0;
             if (!stepSim(s, W, C, 0.f)) { pl.pts.push_back(ccp(s.x, s.y)); break; }
-            const size_t every = i < 600 ? 2 : 6;
+            const size_t every = i < 480 ? 2 : (i < 1200 ? 6 : 12);
             if (i % every == 0) pl.pts.push_back(ccp(s.x, s.y));
         }
     }
@@ -570,7 +585,9 @@ namespace {
         int stepsDone = 0, bestDead = -1;
 
         while (stepsDone < horizon) {
-            const int D = std::min(stageD(stepsDone, dNear, nearSteps), horizon - stepsDone);
+            int D = std::min(stageD(stepsDone, dNear, nearSteps), horizon - stepsDone);
+            // orb/pad yakınında ince adım: orb penceresi dar, kaba adım kaçırır
+            if (D > 2 && !beam.empty() && actionNear(W, nodes[beam[0]].s.x, 90.f)) D = 2;
             const bool hintOk = hint && hintPos + static_cast<size_t>(stepsDone) < hint->size();
             const int hintAct = hintOk ? ((*hint)[hintPos + static_cast<size_t>(stepsDone)] != 0 ? 1 : 0) : -1;
             cand.clear();
@@ -597,7 +614,7 @@ namespace {
                         // açık havada (tavansız) çok yükseğe uçmak gerçek oyunda ölümdür: ucuza kaçış yolu sayma
                         if (nd.s.T >= kInf * 0.5f && nd.s.y > nd.s.gb + 450.f) inc += 20.f;
                     } else {
-                        inc += std::fabs(nd.s.y - root.y) * 0.08f;      // yüksekliği koru (gereksiz inme/çıkma yok)
+                        inc += std::fabs(nd.s.y - root.y) * 0.02f;      // yüksekliği hafifçe koru
                         if (act != prevAct) inc += 1.f;                 // giriş değiştirme
                     }
                     // tehlikeye yakın geçmek pahalı (D'ye göre normalize: ince adımlar haksız cezalanmasın)
@@ -678,11 +695,11 @@ namespace {
         if (wantLines) {
             int shown = 0;
             for (int idx : beam) {
-                if (shown++ >= 14) break;
+                if (shown++ >= 4) break;
                 PathLine pl; pl.kind = 0; chainPoints(nodes, idx, pl); out.lines.push_back(std::move(pl));
             }
             int deadShown = 0;
-            for (int i = static_cast<int>(nodes.size()) - 1; i > 0 && deadShown < 8; --i) {
+            for (int i = static_cast<int>(nodes.size()) - 1; i > 0 && deadShown < 3; --i) {
                 if (!nodes[i].dead) continue;
                 PathLine pl; pl.kind = 1; chainPoints(nodes, i, pl);
                 out.lines.push_back(std::move(pl)); ++deadShown;
@@ -731,6 +748,8 @@ namespace {
             case 84:   o.kind = Kind::Ring; o.sub = E_BLUE;   return true;
             case 1022: o.kind = Kind::Ring; o.sub = E_GREEN;  return true;
             case 1330: o.kind = Kind::Ring; o.sub = E_BLACK;  return true;
+            case 1704: o.kind = Kind::Ring; o.sub = E_DASH;   return true;   // yeşil dash orb
+            case 1751: o.kind = Kind::Ring; o.sub = E_DASHG;  return true;   // pembe dash orb (yerçekimini çevirir)
             // mod portalları
             case 12:   o.kind = Kind::Portal; o.sub = PT_MODE; o.mode = M_CUBE;   return true;
             case 13:   o.kind = Kind::Portal; o.sub = PT_MODE; o.mode = M_SHIP;   return true;
@@ -850,23 +869,29 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         f->unsup.clear(); f->cntDash = f->cntDual = f->cntTele = f->cntMirror = f->cntTrig = 0;
         f->cachedCount = m_objects ? m_objects->count() : 0;
         if (!m_objects) return;
+        std::set<int> unknownSeen;
         for (auto go : CCArrayExt<GameObject*>(m_objects)) {
             if (!go) continue;
             Obj o;
             CCRect r = go->getObjectRect();
             o.x0 = r.getMinX(); o.x1 = r.getMaxX(); o.y0 = r.getMinY(); o.y1 = r.getMaxY();
+            o.ang = go->getRotation();
             {   // bot'un simüle etmediği ama oynanışı etkileyen objeleri say (teşhis için)
                 const int oid = go->m_objectID;
                 bool u = true;
-                if (oid == 1704 || oid == 1751) ++f->cntDash;
-                else if (oid == 286 || oid == 287) ++f->cntDual;
+                if (oid == 286 || oid == 287) ++f->cntDual;
                 else if (oid == 747) ++f->cntTele;
                 else if (oid == 45 || oid == 46) ++f->cntMirror;
                 else if (oid == 901 || oid == 1346 || oid == 1049) ++f->cntTrig;
                 else u = false;
                 if (u) f->unsup.push_back({(o.x0 + o.x1) * 0.5f, (o.y0 + o.y1) * 0.5f, oid});
             }
-            if (!classify(go->m_objectID, go->m_objectType, o)) continue;
+            if (!classify(go->m_objectID, go->m_objectType, o)) {
+                // sınıflanmayan, dekor olmayan objelerin ID'sini bir kez logla (eksik orb ID'lerini bulmak için)
+                if (go->m_objectType != GameObjectType::Decoration && unknownSeen.insert(go->m_objectID).second)
+                    log::info("siniflanmayan obje id={} type={}", go->m_objectID, static_cast<int>(go->m_objectType));
+                continue;
+            }
             if (o.kind == Kind::Slope) slopeLine(go, o);
             f->objs.push_back(o);
         }
@@ -891,7 +916,7 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
             if (o.x1 < minX) continue;
             if (o.kind == Kind::Pad || o.kind == Kind::Ring || o.kind == Kind::Portal) o.orb = orb < kMaxOrb ? static_cast<int16_t>(orb++) : -1;
             f->local.push_back(o);
-            if (f->local.size() >= 12000) break;
+            if (f->local.size() >= 30000) break;
         }
         f->localPm.resize(f->local.size());
         float m = -1e9f;
@@ -987,7 +1012,7 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         std::string nearTxt;
         for (auto& u : f->unsup) {
             if (std::fabs(u.x - r.x) < 150.f && std::fabs(u.y - r.y) < 180.f) {
-                const char* nm = (u.id == 1704 || u.id == 1751) ? "DASH-ORB" : (u.id == 286 || u.id == 287) ? "DUAL" :
+                const char* nm = (u.id == 286 || u.id == 287) ? "DUAL" :
                                  (u.id == 747) ? "TELEPORT" : (u.id == 45 || u.id == 46) ? "AYNA" : "TRIGGER";
                 if (nearTxt.find(nm) == std::string::npos) nearTxt += std::string(nm) + " ";
             }
@@ -1001,15 +1026,15 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
             "sapma son dy=%.2f dv=%.2f | ort(%s) dy=%.2f dv=%.2f | buyuk sapma=%d (son x=%.0f)\n"
             "giris uyusmazligi=%d | yakin: tehlike=%d blok/slope=%d pad=%d orb=%d portal=%d\n"
             "YAKINDA DESTEKLENMEYEN: %s\n"
-            "level: dash=%d dual=%d teleport=%d ayna=%d trigger=%d\n"
-            "kalib: zemin=%.0f kPos=%.4f gMult=%.3f jumpV=%.2f ufoV=%.2f",
+            "level: dual=%d teleport=%d ayna=%d trigger=%d\n"
+            "kalib: zemin=%.0f kPos=%.4f gMult=%.3f jumpV=%.2f ufoV=%.2f dashMul=%.2f",
             r.x, r.y, modeName(r.mode), r.g, r.mini ? 1 : 0, r.vx, r.grounded ? 1 : 0,
             why,
             f->lastErrY, f->lastErrV, modeName(r.mode), f->errY[r.mode], f->errV[r.mode], f->bigErr, f->lastBigErrX,
             f->inputMismatch, nh, ns, np, no, nt,
             nearTxt.empty() ? "yok" : nearTxt.c_str(),
-            f->cntDash, f->cntDual, f->cntTele, f->cntMirror, f->cntTrig,
-            C.groundB, C.kPos, C.gMult[r.mode], C.jumpV, C.ufoV);
+            f->cntDual, f->cntTele, f->cntMirror, f->cntTrig,
+            C.groundB, C.kPos, C.gMult[r.mode], C.jumpV, C.ufoV, C.dashMul);
         showReport(buf, 240 * 12);
         log::info("{}", buf);
     }
@@ -1143,7 +1168,7 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
 
         // ---------- durum + yerel dünya ----------
         const float look = static_cast<float>(Mod::get()->getSettingValue<double>("look-ahead"));
-        const int horizonSteps = std::clamp(static_cast<int>(look * 240.f), 120, 2400);
+        const int horizonSteps = std::clamp(static_cast<int>(look * 240.f), 120, 4800);
         const float reach = f->vx * look * 1.3f + 80.f;
         if (f->gatherReach <= 0.f || px < f->gatherX || px > f->gatherX + 150.f || reach > f->gatherReach - 150.f)
             gather(px, reach + 200.f);
@@ -1182,20 +1207,16 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
             ur.erase(std::remove_if(ur.begin(), ur.end(), [&](const std::pair<float, float>& p) { return p.first < px - 300.f; }), ur.end());
         }
 
-        // ---------- plan: yakın geleceği doğrula, gerekirse yeniden ara ----------
+        // ---------- plan: HER FRAME yeniden ara (önceki plan hint olarak kullanılır) ----------
         if (!f->plan.empty()) f->planPos += steps;
-        bool need = f->plan.empty() || f->planPos + 24 > f->plan.size();
-        if (!need) need = !replayAlive(root, f->plan, f->planPos, 120, W, C, 0.f);
-        const int interval = std::clamp(static_cast<int>(std::ceil(f->searchMs / 0.6f)), 6, 48);
-        if (!need && f->tick - f->lastSearch >= interval) need = true;
-        // bot kapalıyken sadece çizim için, seyrek ara
-        if (!active) need = showTraj && (f->tick - f->lastDraw >= 12);
+        bool need = true;
+        if (!active) need = showTraj;   // bot kapalıyken sadece çizim için
 
         if (need) {
             int Kb = std::clamp(static_cast<int>(Mod::get()->getSettingValue<int64_t>("trajectory-count")), 4, 100);
-            if (f->searchMs > 12.f) Kb = std::max(8, static_cast<int>(Kb * 12.f / f->searchMs));   // yavaşsa otomatik küçült
+            if (f->searchMs > 6.f) Kb = std::max(6, static_cast<int>(Kb * 6.f / f->searchMs));   // yavaşsa otomatik küçült
             const float marginBase = std::clamp(static_cast<float>(Mod::get()->getSettingValue<double>("safety-margin")), 0.f, 14.f);
-            const bool draw = showTraj && (f->tick - f->lastDraw >= 12);
+            const bool draw = showTraj;
             auto t0 = std::chrono::steady_clock::now();
             auto res = runSearch(root, W, C, Kb, horizonSteps, draw, marginBase,
                                  f->plan.empty() ? nullptr : &f->plan, f->planPos);
