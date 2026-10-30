@@ -11,6 +11,8 @@
 //  * TRAJECTORY: bakış süresi 20 sn'ye (4800 adım) çıktı, her frame yeniden planlanır ve çizilir.
 //    Arama süresi 6 ms'yi geçerse beam otomatik küçülür. Çizilen yol daha uzun.
 //  * Uçan modlarda yükseklik koruma cezası 0.08 -> 0.02 (boşluğa gitmeyi engelliyordu).
+//  * KAFA ÇARPMASI: küp/robot/ball/spider bir bloğun altına çarparsa artık ölür (eskiden sadece hızı sıfırlanıyordu).
+//    Planlayıcı bu yolları eler, yani düşük tavanlı yerlerde zıplamaz.
 //
 // v0.9 -> v0.10: [KRİTİK] ZEMİN BUG'I. Zemin varsayılan 90; yalnızca aşağı doğru düzeltilir, yukarı doğru
 //   düzeltme sadece altında hiç blok/slope yokken ve 30 kare üst üste aynı değerde olursa yapılır.
@@ -365,6 +367,9 @@ namespace {
                                 s.y = faceF + gg * half; s.vy = 0.f;
                                 s.grounded = !fly; s.onSlope = false;
                             } else if (uu > 0.f && below) {
+                                // Kafa çarpması: GD'de küp/robot/ball/spider bloğun altına çarparsa ölür.
+                                // Sadece uçan modlar (ship/ufo/swing) tavanda kayar.
+                                if (!fly) return false;
                                 s.y = faceH - gg * half; s.vy = 0.f;
                             } else if (ovr(s.x, s.y, inner, o, haz * 0.5f)) {
                                 return false;
