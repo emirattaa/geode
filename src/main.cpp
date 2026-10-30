@@ -1,4 +1,10 @@
-// Geode Autoplay v0.9 - tüm modlar, orb/pad/portal/slope, beam search planlama
+// Geode Autoplay v0.10 - tüm modlar, orb/pad/portal/slope, beam search planlama
+//
+// v0.9 -> v0.10: [KRİTİK] ZEMİN BUG'I. Eski kalibrasyon, bot bir blok/slope üstündeyken ilk örneği "zemin" sanıp
+//   kalıcı olarak yanlış öğrenebiliyordu (zemin = blok üstü). Bu durumda bot çukurları/dikenleri hiç görmüyor,
+//   düz bir yol tahmin edip zıplamıyordu. Artık zemin varsayılan 90; yalnızca aşağı doğru düzeltilir, yukarı doğru
+//   düzeltme sadece altında hiç blok/slope yokken ve 30 kare üst üste aynı değerde olursa yapılır. Her ölümde sıfırlanır.
+//   jumpV kalibrasyonu da slope fırlatmasından etkilenmeyecek şekilde daraltıldı.
 //
 // v0.8 -> v0.9: TEŞHİS. Ölünce ekranda "ölüm raporu" çıkar (neden öldü: planlayıcı çözüm bulamadı mı, model gerçekten
 //   saptı mı, desteklenmeyen obje mi var). Level'deki desteklenmeyen objeler (dash orb, dual, teleport, ayna, trigger)
@@ -688,6 +694,23 @@ namespace {
         return out;
     }
 
+    // Zemin tahmini (saf fonksiyon, test edilebilir). feet: oyuncunun ayak yüksekliği (yerdeyken).
+    // - zemin sadece AŞAĞI düzeltilir (ayak zeminin altında olamaz)
+    // - YUKARI: altında/hizasında hiç blok/slope yok ve 30 kare üst üste aynı yükseklik
+    void updateGround(float& groundB, float& cand, int& rise, const World& W, float px, float feet, float half) {
+        bool support = false;
+        for (int i = 0; i < W.n; ++i) {
+            const Obj& o = W.L[i];
+            if (o.kind != Kind::Solid && o.kind != Kind::Slope) continue;
+            if (px + half + 2.f > o.x0 && px - half - 2.f < o.x1 && o.y1 > feet - 40.f && o.y0 < feet + 4.f) { support = true; break; }
+        }
+        if (feet < groundB - 1.f) { groundB = feet; rise = 0; }
+        else if (!support && feet > groundB + 1.f) {
+            if (std::fabs(feet - cand) < 0.5f) ++rise; else { cand = feet; rise = 0; }
+            if (rise >= 30) { groundB = feet; rise = 0; }
+        } else rise = 0;
+    }
+
     inline const char* modeName(int m) {
         static const char* const n[M_COUNT] = {"CUBE", "SHIP", "BALL", "UFO", "WAVE", "ROBOT", "SPIDER", "SWING"};
         return (m >= 0 && m < M_COUNT) ? n[m] : "?";
@@ -783,7 +806,7 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         long lastDraw = -1000;
 
         Cfg cfg;
-        bool groundKnown = false;
+        float groundCand = 0.f; int groundRise = 0;
         float acc = 0.f;
         bool havePrev = false;
         float prevX = 0.f, prevY = 0.f, prevVyW = 0.f, prevG = 1.f;
@@ -815,7 +838,7 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         S lastRoot; bool haveLastRoot = false;
         bool lastSurvived = true;
         bool deadReported = false;
-        long reportUntil = 0;
+        long reportUntil = 0, lastStatus = -1000;
         CCLabelBMFont* reportLabel = nullptr;
     };
 
@@ -908,6 +931,7 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         auto f = m_fields.self();
         f->havePrev = false; f->plan.clear(); f->planPos = 0; f->lastSearch = -1000; f->acc = 0.f;
         f->usedRings.clear(); f->robotBoost = 0;
+        f->cfg.groundB = 90.f; f->groundRise = 0; f->groundCand = 0.f;   // zemin tahminini her denemede sıfırla
         releaseAll();
     }
 
@@ -978,14 +1002,14 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
             "giris uyusmazligi=%d | yakin: tehlike=%d blok/slope=%d pad=%d orb=%d portal=%d\n"
             "YAKINDA DESTEKLENMEYEN: %s\n"
             "level: dash=%d dual=%d teleport=%d ayna=%d trigger=%d\n"
-            "kalib: kPos=%.4f gMult=%.3f jumpV=%.2f ufoV=%.2f",
+            "kalib: zemin=%.0f kPos=%.4f gMult=%.3f jumpV=%.2f ufoV=%.2f",
             r.x, r.y, modeName(r.mode), r.g, r.mini ? 1 : 0, r.vx, r.grounded ? 1 : 0,
             why,
             f->lastErrY, f->lastErrV, modeName(r.mode), f->errY[r.mode], f->errV[r.mode], f->bigErr, f->lastBigErrX,
             f->inputMismatch, nh, ns, np, no, nt,
             nearTxt.empty() ? "yok" : nearTxt.c_str(),
             f->cntDash, f->cntDual, f->cntTele, f->cntMirror, f->cntTrig,
-            C.kPos, C.gMult[r.mode], C.jumpV, C.ufoV);
+            C.groundB, C.kPos, C.gMult[r.mode], C.jumpV, C.ufoV);
         showReport(buf, 240 * 12);
         log::info("{}", buf);
     }
@@ -1079,9 +1103,10 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
                 if (acc > 0.002f && acc < 0.5f && std::fabs(curU) < C.shipUp - 0.2f && curU > -C.shipDown + 0.2f)
                     C.shipAcc[ci] = C.shipAcc[ci] * 0.9f + acc * 0.1f;
             }
-            if (mode == M_CUBE && f->prevMode == M_CUBE && f->prevGrounded && !grounded && f->held && vyW * g > 3.f) {
+            if (autoCal && mode == M_CUBE && f->prevMode == M_CUBE && f->prevGrounded && !grounded && f->held &&
+                std::fabs(f->prevVyW) < 0.5f && vyW * g > 9.f) {   // slope fırlatması (≈6) karışmasın
                 float jm = (vyW * g + gstep * C.gMult[M_CUBE]) / (mini ? 0.8f : 1.f);
-                if (jm > 6.f && jm < 15.f) C.jumpV = C.jumpV * 0.5f + jm * 0.5f;
+                if (jm > 9.5f && jm < 13.5f) C.jumpV = C.jumpV * 0.5f + jm * 0.5f;
             }
             if (mode == M_UFO && f->prevMode == M_UFO && pressed && vyW * g > 2.f) {
                 float um = vyW * g + gstep * C.gMult[M_UFO];
@@ -1132,21 +1157,9 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         root.robotBoost = static_cast<int16_t>(f->robotBoost);
         const float halfNow = halfOf(root);
 
-        // zemin kalibrasyonu (mod alanından ÖNCE; yalnızca gerçek zemindeyken ve küçük kaymalarla)
-        if (grounded && g > 0.f && (mode == M_CUBE || mode == M_ROBOT)) {
-            bool onObj = false;
-            for (int i = 0; i < n && !onObj; ++i) {
-                const Obj& o = W.L[i];
-                if ((o.kind == Kind::Solid || o.kind == Kind::Slope) && px + halfNow > o.x0 && px - halfNow < o.x1 &&
-                    std::fabs((py - halfNow) - o.y1) < 3.f) onObj = true;
-            }
-            if (!onObj) {
-                float gbm = py - halfNow;
-                if (std::fabs(gbm - C.groundB) < 4.f || (!f->groundKnown && std::fabs(gbm - 90.f) < 200.f)) {
-                    C.groundB = gbm; f->groundKnown = true;
-                }
-            }
-        }
+        // zemin tahmini (mod alanından ÖNCE): bkz. updateGround
+        if (grounded && g > 0.f && (mode == M_CUBE || mode == M_ROBOT))
+            updateGround(C.groundB, f->groundCand, f->groundRise, W, px, py - halfNow, halfNow);
         root.gb = C.groundB;
         {   // mod alanı: son geçilen mod portalından
             float pc = py;
@@ -1219,6 +1232,14 @@ class $modify(CubeBotGJBGL, GJBaseGameLayer) {
         }
         f->held2 = f->held;
         f->held = want;
+
+        if (debug && f->tick - f->lastStatus >= 20) {   // debug-log açıkken canlı durum satırı
+            f->lastStatus = f->tick;
+            char sb[256];
+            std::snprintf(sb, sizeof sb, "mod=%s zemin=%.0f g=%+.0f hiz=%.0f plan=%s kPos=%.3f arama=%.1fms",
+                          modeName(mode), C.groundB, g, f->vx, f->lastSurvived ? "OK" : "OLUM-KACINILMAZ", C.kPos, f->searchMs);
+            showReport(sb, 90);
+        }
 
         {   // bir sonraki adım için tahmin (teşhis)
             S p = root; p.prevHeld = root.held; p.held = want;
