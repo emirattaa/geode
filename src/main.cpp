@@ -1,164 +1,183 @@
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
-#include <Geode/modify/PlayerObject.hpp>
-#include <cocos2d.h>
-#include <vector>
-#include <cmath>
+#include <Geode/modify/LevelEditorLayer.hpp>
+#include <Geode/modify/GJBaseGameLayer.hpp>
+#include <Geode/modify/EffectGameObject.hpp>
+#include <Geode/modify/GameObject.hpp>
+#include <Geode/modify/HardStreak.hpp>
+#include "TrajectoryNode.hpp"
 
 using namespace geode::prelude;
 
-class $modify(MyPlayLayer, PlayLayer) {
-    struct Fields {
-        cocos2d::CCDrawNode* m_trajectoryNode = nullptr;
-        bool m_isHoldingDash = false;
-        GameObject* m_currentDashOrb = nullptr;
-        int m_jumpCooldown = 0;
-    };
-
-    bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
-        if (!PlayLayer::init(level, useReplay, dontCreateObjects)) {
-            return false;
-        }
-
-        // Yörünge çizimi için CCDrawNode oluşturulup sahneye ekleniyor
-        m_fields->m_trajectoryNode = cocos2d::CCDrawNode::create();
-        if (m_fields->m_trajectoryNode && m_objectLayer) {
-            m_objectLayer->addChild(m_fields->m_trajectoryNode, 999);
-        }
-
-        return true;
+class $modify(TrajPlayLayer, PlayLayer)
+{
+    void createObjectsFromSetupFinished()
+    {
+        PlayLayer::createObjectsFromSetupFinished();
+        m_objectLayer->addChild(TrajectoryNode::create(this));
     }
 
-    void update(float dt) {
-        PlayLayer::update(dt);
+    void destroyPlayer(PlayerObject* player, GameObject* object)
+    {
+        if (TrajectoryNode::active() && player)
+        {
+            player->m_isDead = true;
+            return;
+        }
+        PlayLayer::destroyPlayer(player, object);
+    }
 
-        if (!m_player1 || !m_fields->m_trajectoryNode) {
+    void playEndAnimationToPos(cocos2d::CCPoint p0)
+    {
+        if (!TrajectoryNode::active())
+            PlayLayer::playEndAnimationToPos(p0);
+    }
+};
+
+class $modify(TrajEditor, LevelEditorLayer)
+{
+    bool init(GJGameLevel* level, bool noUI)
+    {
+        if (!LevelEditorLayer::init(level, noUI)) return false;
+        m_objectLayer->addChild(TrajectoryNode::create(this));
+        return true;
+    }
+};
+
+class $modify(TrajBGL, GJBaseGameLayer)
+{
+    // simulasyon sirasinda sadece portal / pad / ring etkilerini elle uygula
+    void customCollisionCheck(PlayerObject* player, GameObject* obj)
+    {
+        bool intersects;
+        if (obj->m_orientedBox && obj->m_shouldUseOuterOb)
+            intersects = obj->m_orientedBox->overlaps(player->m_orientedBox);
+        else
+            intersects = player->getObjectRect().intersectsRect(obj->getObjectRect());
+        if (!intersects) return;
+
+        if (obj->m_objectID == 1829) player->stopDashing();
+
+        switch (obj->m_objectType)
+        {
+            case GameObjectType::CubePortal:
+                player->toggleFlyMode(false, false);
+                player->toggleRollMode(false, false);
+                player->toggleBirdMode(false, false);
+                player->toggleDartMode(false, false);
+                player->toggleRobotMode(false, false);
+                player->toggleSpiderMode(false, false);
+                player->toggleSwingMode(false, false);
+                break;
+            case GameObjectType::ShipPortal:   player->toggleFlyMode(true, true); break;
+            case GameObjectType::BallPortal:   player->toggleRollMode(true, true); break;
+            case GameObjectType::UfoPortal:    player->toggleBirdMode(true, true); break;
+            case GameObjectType::WavePortal:   player->toggleDartMode(true, true); break;
+            case GameObjectType::RobotPortal:  player->toggleRobotMode(true, true); break;
+            case GameObjectType::SpiderPortal: player->toggleSpiderMode(true, true); break;
+            case GameObjectType::SwingPortal:  player->toggleSwingMode(true, true); break;
+
+            case GameObjectType::NormalGravityPortal:  this->flipGravity(player, false, true); break;
+            case GameObjectType::InverseGravityPortal: this->flipGravity(player, true, true); break;
+            case GameObjectType::GravityTogglePortal:  this->flipGravity(player, !player->m_isUpsideDown, true); break;
+
+            case GameObjectType::YellowJumpPad:
+            case GameObjectType::PinkJumpPad:
+            case GameObjectType::RedJumpPad:
+            case GameObjectType::SpiderPad:
+                if (static_cast<EffectGameObject*>(obj)->m_isReverse)
+                    player->reversePlayer(static_cast<EffectGameObject*>(obj));
+                player->bumpPlayer(this->getBumpMod(player, (int)obj->m_objectType),
+                                   (int)obj->m_objectType, true, nullptr);
+                break;
+
+            case GameObjectType::YellowJumpRing:
+            case GameObjectType::PinkJumpRing:
+            case GameObjectType::GravityRing:
+            case GameObjectType::GreenRing:
+            case GameObjectType::DropRing:
+            case GameObjectType::RedJumpRing:
+            case GameObjectType::CustomRing:
+            case GameObjectType::DashRing:
+            case GameObjectType::GravityDashRing:
+            case GameObjectType::SpiderOrb:
+                // halkalar simulasyonda tiklanmis sayilmaz (gercek oyuncu basmadan etkilenmez)
+                break;
+
+            default: break;
+        }
+    }
+
+    void collisionCheckObjects(PlayerObject* p0, gd::vector<GameObject*>* p1, int p2, float p3)
+    {
+        if (!TrajectoryNode::active() || !p1)
+        {
+            GJBaseGameLayer::collisionCheckObjects(p0, p1, p2, p3);
             return;
         }
 
-        // 1. Otomatik Oynama (Spike / Orb / Dash Algılama)
-        processAutoPlay();
-
-        // 2. Yörünge Çizgisi Hesaplama ve Çizimi
-        renderTrajectory();
+        gd::vector<GameObject*> solids;
+        for (auto obj : *p1)
+        {
+            bool keep = false;
+            switch (obj->m_objectType)
+            {
+                case GameObjectType::Solid:
+                case GameObjectType::Hazard:
+                case GameObjectType::AnimatedHazard:
+                case GameObjectType::Slope:
+                    keep = true; break;
+                default: break;
+            }
+            if (keep) solids.push_back(obj);
+            else this->customCollisionCheck(p0, obj);
+        }
+        GJBaseGameLayer::collisionCheckObjects(p0, &solids, (int)solids.size(), p3);
     }
 
-    void processAutoPlay() {
-        if (!m_player1 || !m_objects) return;
-
-        cocos2d::CCPoint playerPos = m_player1->getPosition();
-        bool shouldJump = false;
-        bool inDashOrbRange = false;
-
-        if (m_fields->m_jumpCooldown > 0) {
-            m_fields->m_jumpCooldown--;
-        }
-
-        CCObject* obj = nullptr;
-        CCARRAY_FOREACH(m_objects, obj) {
-            auto gameObj = typeinfo_cast<GameObject*>(obj);
-            if (!gameObj) continue;
-
-            cocos2d::CCPoint objPos = gameObj->getPosition();
-            float distX = objPos.x - playerPos.x;
-            float distY = std::abs(objPos.y - playerPos.y);
-            float totalDist = std::sqrt(distX * distX + (objPos.y - playerPos.y) * (objPos.y - playerPos.y));
-
-            int objID = gameObj->m_objectID;
-
-            // Standart Orblar (Sarı: 36, Pembe: 141, Kırmızı: 1331, Mavi: 84, Yeşil Zıplama: 1022, Örümcek: 1334, Siyah: 1705)
-            bool isStandardOrb = (objID == 36 || objID == 141 || objID == 1331 || objID == 84 || objID == 1022 || objID == 1334 || objID == 1705);
-            
-            // Basılı tutulan Dash Orbları (Yeşil Dash: 1704, Pembe Dash: 1751)
-            bool isDashOrb = (objID == 1704 || objID == 1751);
-
-            // 1. Orb Kontrolleri
-            if (isStandardOrb) {
-                if (totalDist <= 45.0f && distX >= -10.0f && distX <= 35.0f) {
-                    if (m_fields->m_jumpCooldown == 0) {
-                        shouldJump = true;
-                    }
-                }
-            } else if (isDashOrb) {
-                if (totalDist <= 50.0f) {
-                    inDashOrbRange = true;
-                    m_fields->m_currentDashOrb = gameObj;
-                }
-            }
-
-            // 2. Diken (Spike) ve Engel Kontrolleri
-            bool isSpike = (gameObj->m_objectType == GameObjectType::Hazard || objID == 8 || objID == 9 || objID == 39 || objID == 103 || objID == 361);
-            if (isSpike) {
-                if (distX > 0.0f && distX <= 38.0f && distY <= 30.0f && m_player1->m_isOnGround) {
-                    if (m_fields->m_jumpCooldown == 0) {
-                        shouldJump = true;
-                    }
-                }
-            }
-        }
-
-        // Dash Orbları İçin Basılı Tutma Mantığı
-        if (inDashOrbRange) {
-            if (!m_fields->m_isHoldingDash) {
-                m_player1->pushButton(PlayerButton::Jump);
-                m_fields->m_isHoldingDash = true;
-            }
-        } else {
-            if (m_fields->m_isHoldingDash) {
-                m_player1->releaseButton(PlayerButton::Jump);
-                m_fields->m_isHoldingDash = false;
-                m_fields->m_currentDashOrb = nullptr;
-            }
-        }
-
-        // Tek Seferlik Zıplama/Orb Tetikleme Mantığı
-        if (shouldJump && !m_fields->m_isHoldingDash) {
-            m_player1->pushButton(PlayerButton::Jump);
-            m_player1->releaseButton(PlayerButton::Jump);
-            m_fields->m_jumpCooldown = 6;
-        }
+    bool canBeActivatedByPlayer(PlayerObject* p0, EffectGameObject* p1)
+    {
+        if (TrajectoryNode::active()) return false;
+        return GJBaseGameLayer::canBeActivatedByPlayer(p0, p1);
     }
 
-    void renderTrajectory() {
-        m_fields->m_trajectoryNode->clear();
+    void playerTouchedRing(PlayerObject* p0, RingObject* p1)
+    {
+        if (!TrajectoryNode::active())
+            GJBaseGameLayer::playerTouchedRing(p0, p1);
+    }
 
-        if (!m_player1) return;
+    void activateSFXTrigger(SFXTriggerGameObject* p0)
+    {
+        if (!TrajectoryNode::active()) GJBaseGameLayer::activateSFXTrigger(p0);
+    }
 
-        cocos2d::CCPoint currentPos = m_player1->getPosition();
-        double xVel = m_player1->m_xVelocity;
-        double yVel = m_player1->m_yVelocity;
+    void activateSongEditTrigger(SongTriggerGameObject* p0)
+    {
+        if (!TrajectoryNode::active()) GJBaseGameLayer::activateSongEditTrigger(p0);
+    }
+};
 
-        float speedX = (xVel != 0.0) ? static_cast<float>(xVel) : 10.3f;
-        float velY = static_cast<float>(yVel);
-        float gravity = -0.95f;
+class $modify(TrajStreak, HardStreak)
+{
+    void addPoint(cocos2d::CCPoint p0)
+    {
+        if (!TrajectoryNode::active()) HardStreak::addPoint(p0);
+    }
+};
 
-        cocos2d::CCPoint simPos = currentPos;
-        int simSteps = 60;
-        float dtStep = 1.0f / 60.0f;
+class $modify(TrajObj, GameObject)
+{
+    void playShineEffect()
+    {
+        if (!TrajectoryNode::active()) GameObject::playShineEffect();
+    }
+};
 
-        for (int i = 0; i < simSteps; i++) {
-            cocos2d::CCPoint nextPos;
-            nextPos.x = simPos.x + (speedX * 30.0f * dtStep);
-            
-            velY += gravity;
-            nextPos.y = simPos.y + velY;
-
-            // Zemin Hizası Kontrolü
-            if (nextPos.y < 105.0f && m_player1->m_isOnGround) {
-                nextPos.y = simPos.y;
-                velY = 0.0f;
-            }
-
-            // Dash durumuna göre yörünge rengi değişimi
-            cocos2d::ccColor4F lineColor = ccc4f(0.0f, 1.0f, 0.4f, 0.8f);
-            if (m_fields->m_isHoldingDash) {
-                lineColor = ccc4f(1.0f, 0.3f, 0.8f, 0.9f);
-            }
-
-            m_fields->m_trajectoryNode->drawSegment(simPos, nextPos, 1.5f, lineColor);
-            m_fields->m_trajectoryNode->drawDot(nextPos, 2.5f, ccc4f(1.0f, 1.0f, 1.0f, 0.6f));
-
-            simPos = nextPos;
-        }
+class $modify(TrajTrigger, EffectGameObject)
+{
+    void triggerObject(GJBaseGameLayer* p0, int p1, gd::vector<int> const* p2)
+    {
+        if (!TrajectoryNode::active()) EffectGameObject::triggerObject(p0, p1, p2);
     }
 };
