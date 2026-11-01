@@ -25,6 +25,17 @@ jobs:
     runs-on: ${{ matrix.config.os }}
     steps:
       - uses: actions/checkout@v4
+
+      # Geode 4.x ile NDK 29 / Clang 21 uyumsiz (__synth3way hatasi), NDK 27 kullan
+      - name: Pin Android NDK 27
+        if: matrix.config.target == 'Android32' || matrix.config.target == 'Android64'
+        run: |
+          NDK27=$(ls -d /usr/local/lib/android/sdk/ndk/27* | sort | tail -n1)
+          echo "Using $NDK27"
+          echo "ANDROID_NDK_LATEST_HOME=$NDK27" >> $GITHUB_ENV
+          echo "ANDROID_NDK_HOME=$NDK27" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=$NDK27" >> $GITHUB_ENV
+
       - name: Build the mod
         uses: geode-sdk/build-geode-mod@main
         with:
