@@ -1,9 +1,13 @@
-# Geode Autoplay
+# Show Trajectory (Geode)
 
-Tüm modlarda (cube, ship, ball, UFO, wave, robot, spider, swing) otomatik oynayan Geode modu.
+Oyuncunun **basili tutarsa** ve **birakirsa** gidecegi yolu cizer (Player 1 / Player 2).
 
-- Orb: sarı, pembe, kırmızı, mavi, yeşil, siyah. Pad: sarı, pembe, kırmızı, mavi.
-- Portal: mod, yerçekimi, boyut, hız. Platform: blok ve slope.
-- 30 farklı giriş planı 2 saniye ileriye simüle edilir (ayarlanabilir, 4 snye kadar). Tehdit yoksa hiçbir şey yapmaz, varsa en geç ve en az girişle çözer.
-- Pause menüsünün sol alt kutusu botu açar/kapatır. Ayarlardan yörünge çizgileri ve yörünge sayısı değişir.
-- Desteklenmeyenler: dash/spider/toggle orb, trigger ile hareket eden objeler, dual mod, platformer mod.
+## Derleme
+1. Bu klasoru GitHub reposuna yukle.
+2. Actions > "Build Geode Mod" > Run workflow.
+3. Artifact'tan `.geode` dosyasini indir, `geode/mods` klasorune at.
+
+`mod.json` icindeki `id`, `developer` ve `geode` surumunu kendi diger modlarina gore duzenle.
+
+## Ayarlar
+Aktif, P1/P2, renkler, adim sayisi, adim hassasiyeti, carpisma hitbox'i.
