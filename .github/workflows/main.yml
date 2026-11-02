@@ -1,13 +1,7 @@
-name: Build and Release Geode Mod
+name: Auto Build and Release
 
 on:
   push:
-    branches:
-      - main
-      - master
-    tags:
-      - 'v*'
-  pull_request:
     branches:
       - main
       - master
@@ -18,19 +12,23 @@ jobs:
 
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Download all workflow artifacts
+      - name: Download Build Artifacts
         uses: actions/download-artifact@v4
+        with:
+          path: build-output
 
-      - name: Create GitHub Release and Upload Artifacts
+      - name: Update Latest Release Automatically
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            **/*.geode
+          tag_name: latest
+          name: "Otomatik Mod Sürümü (Latest)"
+          body: "Telefondan veya tarayıcıdan yapılan son değişikliklerle otomatik derlendi."
+          files: build-output/**/*.geode
+          prerelease: true
+          overwrite: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          
