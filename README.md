@@ -1,13 +1,23 @@
-# Show Trajectory (Geode)
+# Template
+This is where she makes a mod.
 
-Oyuncunun **basili tutarsa** ve **birakirsa** gidecegi yolu cizer (Player 1 / Player 2).
+<img src="logo.png" width="150" alt="the mod's logo" />
 
-## Derleme
-1. Bu klasoru GitHub reposuna yukle.
-2. Actions > "Build Geode Mod" > Run workflow.
-3. Artifact'tan `.geode` dosyasini indir, `geode/mods` klasorune at.
+*Update logo.png to change your mod's icon (please)*
 
-`mod.json` icindeki `id`, `developer` ve `geode` surumunu kendi diger modlarina gore duzenle.
+## Getting started
+We recommend heading over to [the getting started section on our docs](https://docs.geode-sdk.org/getting-started/) for useful info on what to do next.
 
-## Ayarlar
-Aktif, P1/P2, renkler, adim sayisi, adim hassasiyeti, carpisma hitbox'i.
+## Build instructions
+For more info, see [our docs](https://docs.geode-sdk.org/getting-started/create-mod#build)
+```sh
+# Assuming you have the Geode CLI set up already
+geode build
+```
+
+# Resources
+* [Geode SDK Documentation](https://docs.geode-sdk.org/)
+* [Geode SDK Source Code](https://github.com/geode-sdk/geode/)
+* [Geode CLI](https://github.com/geode-sdk/cli)
+* [Bindings](https://github.com/geode-sdk/bindings/)
+* [Dev Tools](https://github.com/geode-sdk/DevTools)
